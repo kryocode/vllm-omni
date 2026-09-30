@@ -366,6 +366,9 @@ def minimax_h3_denoise_loop(
 
     num_steps = len(sigmas_video) - 1
     for step in range(num_steps):
+        torch.npu.synchronize()
+        torch.distributed.barrier()
+
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
             s_v, s_v_next = sigmas_video[step], sigmas_video[step + 1]
@@ -450,6 +453,9 @@ def minimax_h3_denoise_loop(
                 audio_rows[~audio_update] = audio_anchor  # per-step audio ref reset
             if on_step is not None:
                 on_step(step, video_rows, audio_rows)
+
+        torch.npu.synchronize()
+        torch.distributed.barrier()
 
     minimax_h3_publish_denoise_progress(None, None, None)
     return video_rows, audio_rows
