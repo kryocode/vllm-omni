@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from vllm_omni.diffusion.utils.stage_profiling import stage, stage_span
 import importlib
 import json
 import os
@@ -989,6 +990,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     # denormalizes and clamps into the unit interval.
     chunk_value_range: ClassVar[tuple[float, float]] = (0.0, 1.0)
 
+    @stage('vae/video_streaming')
     @torch.inference_mode()
     def decode_with_chunks(self, z: torch.Tensor, *, on_chunk: DecodedChunkConsumer) -> None:
         """Decode temporal clips and synchronously publish frames-only chunks.

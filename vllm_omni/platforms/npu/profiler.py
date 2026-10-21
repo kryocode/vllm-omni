@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import os
 
+from vllm_omni.diffusion.utils.stage_profiling import begin_stage_capture, end_stage_capture
+
 from typing_extensions import override
 from vllm.config import ProfilerConfig
 from vllm.logger import init_logger
@@ -27,6 +29,18 @@ class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
     - No key_averages() support - requires offline parsing with
       torch_npu.profiler.profiler.analyse()
     """
+
+    @override
+    def _start(self) -> None:
+        super()._start()
+        begin_stage_capture()
+
+    @override
+    def _stop(self) -> None:
+        try:
+            super()._stop()
+        finally:
+            end_stage_capture()
 
     @override
     def _get_default_activities(self) -> list[TorchProfilerActivity]:
@@ -78,7 +92,10 @@ class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
             experimental_config=experimental_config,
             # Use tensorboard_trace_handler directly - NPU profiler expects
             # this specific handler format
-            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(npu_trace_dir),
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                npu_trace_dir,
+                analyse_flag=os.environ.get("VLLM_OMNI_H3_STAGE_PROFILING") != "1",
+            ),
         )
 
     @override

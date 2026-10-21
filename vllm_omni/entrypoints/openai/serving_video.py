@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from vllm_omni.diffusion.utils.stage_profiling import stage, stage_span
 import copy
 import math
 import time
@@ -115,6 +116,25 @@ class LatentEditInput:
     cleanup_paths: tuple[str, ...] = ()
 
 
+def _log_vae_tail(timing: dict[str, object] | None, api_end_ns: int,
+                  reference_id: str, mp4_bytes: int) -> float | None:
+    if not isinstance(timing, dict):
+        return None
+    start_ns = timing.get("start_ns")
+    mode = timing.get("mode")
+    end_ns = timing.get("end_ns") if mode == "streaming" else api_end_ns
+    if not isinstance(start_ns, int) or not isinstance(end_ns, int) or end_ns < start_ns:
+        logger.warning("VAE_TAIL_INVALID request_id=%s", reference_id)
+        return None
+    latency_ms = (end_ns - start_ns) / 1_000_000
+    logger.info(
+        "VAE_TAIL request_id=%s worker_request_id=%s mode=%s "
+        "tail_latency_ms=%.6f start_ns=%d end_ns=%d mp4_bytes=%d",
+        reference_id, timing.get("request_id"), mode, latency_ms, start_ns, end_ns, mp4_bytes,
+    )
+    return latency_ms
+
+
 @dataclass
 class VideoGenerationArtifacts:
     """Normalized outputs and profiler metadata extracted from one request."""
@@ -127,6 +147,7 @@ class VideoGenerationArtifacts:
     stage_durations: dict[str, float]
     peak_memory_mb: float
     metrics: dict[str, object] | None = None
+    vae_tail: dict[str, object] | None = None
 
 
 def _video_metadata_from_artifacts(artifacts: VideoGenerationArtifacts) -> dict[str, object]:
@@ -278,6 +299,7 @@ class OmniOpenAIServingVideo:
     async def abort_request(self, request_id: str) -> None:
         await self._engine_client.abort(request_id, timeout=ABORT_TIMEOUT_S)
 
+    @stage('api/engine_wait_and_extract')
     async def _run_and_extract(
         self,
         request: VideoGenerationRequest,
@@ -509,6 +531,7 @@ class OmniOpenAIServingVideo:
             stage_durations=self._extract_stage_durations(result),
             peak_memory_mb=self._extract_peak_memory_mb(result),
             metrics=metrics,
+            vae_tail=metadata.get("vae_tail") if isinstance(metadata, dict) else None,
         )
 
     async def generate_videos(
@@ -564,6 +587,7 @@ class OmniOpenAIServingVideo:
             peak_memory_mb=artifacts.peak_memory_mb,
         )
 
+    @stage('api/generate_video_bytes')
     async def generate_video_bytes(
         self,
         request: VideoGenerationRequest,
@@ -607,6 +631,7 @@ class OmniOpenAIServingVideo:
         _t_encode_start = time.perf_counter()
         if isinstance(artifacts.videos[0], bytes):
             video_bytes = artifacts.videos[0]
+            _log_vae_tail(artifacts.vae_tail, time.monotonic_ns(), reference_id, len(video_bytes))
             _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
             logger.info("Video response received pre-encoded MP4 bytes: %.2f ms", _t_encode_ms)
             return (
@@ -623,6 +648,7 @@ class OmniOpenAIServingVideo:
             video_codec_options=video_codec_options,
             frame_converter=self._video_frame_converter,
         )
+        _log_vae_tail(artifacts.vae_tail, time.monotonic_ns(), reference_id, len(video_bytes))
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
         return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb, artifacts.actions[0], video_metadata

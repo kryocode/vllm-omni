@@ -55,6 +55,7 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.platforms import current_omni_platform
 
+from .attention.mindiesd_h3 import MindIESDH3Parallel
 from .fasth3 import _resolve_native_target
 
 if TYPE_CHECKING:
@@ -475,6 +476,7 @@ class MiniMaxH3Attention(nn.Module):
             prefix=prefix,
             impl_overrides={"FASTVIDEO_VSA": MiniMaxH3VSAImpl},
         )
+        self._mindiesd_parallel = MindIESDH3Parallel()
 
     def enable_vsa_gate(self) -> None:
         """Build the VSA compression gate this attention would otherwise lack.
@@ -596,6 +598,7 @@ class MiniMaxH3Attention(nn.Module):
                 "max_seqlen_q": max_seqlen,
                 "max_seqlen_k": max_seqlen,
                 "valid_kv_length": used,
+                "h3_num_requests": num_requests,
                 # Opt the NPU flash backend into the packed varlen path so the
                 # quadratic full_qk mask is never materialized. Ring attention
                 # is excluded: it keeps the aligned padding rows for its
@@ -619,12 +622,11 @@ class MiniMaxH3Attention(nn.Module):
             },
             video_layout=video_layout,
         )
-        return self.attention(
-            q.unsqueeze(0),
-            k.unsqueeze(0),
-            v.unsqueeze(0),
-            metadata,
-        ).squeeze(0)
+        q_bsnd, k_bsnd, v_bsnd = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+        out = self._mindiesd_parallel.try_attention(self.attention, q_bsnd, k_bsnd, v_bsnd, metadata)
+        if out is None:
+            out = self.attention(q_bsnd, k_bsnd, v_bsnd, metadata)
+        return out.squeeze(0)
 
     def forward(
         self,
@@ -1240,6 +1242,11 @@ class MiniMaxH3DiTModel(nn.Module):
             quant_config,
             prefix="final_layer",
         )
+        # One lazy communication state shared across DiT layers and steps.
+        self._mindiesd_parallel = MindIESDH3Parallel()
+        for module in self.modules():
+            if isinstance(module, MiniMaxH3Attention):
+                module._mindiesd_parallel = self._mindiesd_parallel
         self._mark_missing_params_required()
 
     def enable_vsa_gates(self, *, sparsity: float | None = None) -> None:

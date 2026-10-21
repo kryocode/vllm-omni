@@ -2933,6 +2933,9 @@ async def download_video(video_id: str) -> Response:
     return response
 
 
+from vllm_omni.diffusion.utils.stage_profiling import start_api_profile, stop_api_profile
+
+
 @profiler_router.post("/start_profile")
 async def start_profile(raw_request: Request, request: ProfileRequest | None = None):
     """Start profiling for the engine.
@@ -2950,6 +2953,7 @@ async def start_profile(raw_request: Request, request: ProfileRequest | None = N
         logger.info("Starting profiler for stages: %s", stages if stages else "all")
         engine_client = raw_request.app.state.engine_client
         await engine_client.start_profile(stages=stages)
+        start_api_profile()
         logger.info("Profiler started.")
         return JSONResponse(content={"status": "SUCCESS"})
     except Exception as e:
@@ -2975,7 +2979,10 @@ async def stop_profile(raw_request: Request, request: ProfileRequest | None = No
         stages = request.stages if request else None
         logger.info("Stopping profiler for stages: %s", stages if stages else "all")
         engine_client = raw_request.app.state.engine_client
-        await engine_client.stop_profile(stages=stages)
+        try:
+            await engine_client.stop_profile(stages=stages)
+        finally:
+            stop_api_profile()
         logger.info("Profiler stopped.")
         return JSONResponse(content={"status": "SUCCESS"})
     except Exception as e:

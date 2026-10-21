@@ -1,3 +1,4 @@
+from vllm_omni.diffusion.utils.stage_profiling import stage, stage_span
 import functools
 import re
 import time
@@ -34,7 +35,7 @@ def profiler(name: str, func: Callable, instance: Any) -> Callable:
             with instance._profiler_lock:
                 instance._stage_durations[metric_name] = instance._stage_durations.get(metric_name, 0.0) + duration
 
-    return wrapper
+    return stage(metric_name)(wrapper)
 
 
 def _parse_part(part: str) -> tuple[str, int | None]:

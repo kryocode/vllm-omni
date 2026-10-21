@@ -25,6 +25,7 @@ See ``openai/README.md`` and ``video/README.md`` (utils vs helpers, no overlap).
 
 from __future__ import annotations
 
+from vllm_omni.diffusion.utils.stage_profiling import stage, stage_span
 import base64
 import binascii
 import os
@@ -538,6 +539,7 @@ def _coerce_video_to_frames(video: Any) -> list[np.ndarray]:
     raise ValueError(f"Unsupported video payload type: {type(video)}")
 
 
+@stage('api/audio_to_host')
 def _coerce_audio_to_numpy(audio: Any) -> np.ndarray:
     """Convert an audio payload into a float32 numpy array for muxing."""
     if isinstance(audio, torch.Tensor):
@@ -556,6 +558,7 @@ def _coerce_audio_to_numpy(audio: Any) -> np.ndarray:
     return arr.astype(np.float32)
 
 
+@stage('api/frame_prepare')
 def _prepare_video_frames(video: Any) -> tuple[list[np.ndarray], tuple[int, ...], np.dtype]:
     """Normalize and validate frames for the common video encoding dispatcher."""
     frames = _coerce_video_to_frames(video)
@@ -671,6 +674,7 @@ class _PlanarFrameConverter:
             self._scratch_local.channel = scratch
         return scratch
 
+    @stage('api/frame_conversion')
     def _build_frame(self, frame: np.ndarray, common_dtype: np.dtype) -> av.VideoFrame:
         """Build one quantized GBR PyAV frame."""
         import av
@@ -828,6 +832,7 @@ def _encode_video_bytes_legacy(
     )
 
 
+@stage('api/mp4_encode')
 def _encode_video_bytes(
     video: Any,
     fps: int | float,

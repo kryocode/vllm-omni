@@ -531,6 +531,15 @@ class RainFusionAttentionImpl(AttentionImpl):
             "sparsity": self.rainfusion.sparsity,
             "precision": precision,
         }
+        geometry_cache = extra.get("mindiesd_rf_geometry_cache")
+        output = extra.get("mindiesd_rf_output")
+        if geometry_cache is not None or output is not None:
+            if precision != "bf16" or plan.video_spans is None or used != query.shape[1]:
+                raise ValueError("Prepared BF16 RainFusion requires an unpadded full multi-span sequence.")
+            if geometry_cache is not None:
+                common_kwargs["geometry_cache"] = geometry_cache
+            if output is not None:
+                common_kwargs["out"] = output
         if plan.video_spans is not None:
             out = sparse_attention(
                 q,

@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+from vllm_omni.diffusion.utils.stage_profiling import stage, stage_span
 import json
 import math
 import os
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
@@ -359,6 +361,16 @@ def _request_output_fps(sampling_params: Any) -> int:
     return resolve_minimax_h3_fps(sampling_params)
 
 
+def _start_vae_tail(request_id: str, mode: str) -> dict[str, Any] | None:
+    if os.environ.get("VLLM_OMNI_H3_TAIL_TIMING") != "1":
+        return None
+    start_ns = time.monotonic_ns()
+    logger.info("VAE_TAIL_START request_id=%s mode=%s start_ns=%d pid=%d",
+                request_id, mode, start_ns, os.getpid())
+    return {"request_id": request_id, "mode": mode, "start_ns": start_ns}
+
+
+@stage('output/postprocess')
 def _minimax_h3_post_process(output, output_type: str = "np", sampling_params: Any = None):
     """Convert the joint video/audio output without capturing worker state.
 
@@ -369,6 +381,20 @@ def _minimax_h3_post_process(output, output_type: str = "np", sampling_params: A
     frames on the accelerator, so there is nothing left to scale or transpose
     here.
     """
+    if isinstance(output, tuple) and len(output) == 3:
+        video, audio, tail_timing = output
+        processed = _minimax_h3_post_process((video, audio), output_type, sampling_params)
+        if not isinstance(processed, dict):
+            return processed
+        return {
+            "payload": {key: value for key, value in processed.items()
+                        if key not in {"fps", "audio_sample_rate"}},
+            "metadata": {
+                "video": {"fps": processed["fps"]},
+                "audio": {"sample_rate": processed["audio_sample_rate"]},
+                "vae_tail": tail_timing,
+            },
+        }
     fps = _request_output_fps(sampling_params)
     if not isinstance(output, tuple) or len(output) != 2:
         return output
@@ -1421,12 +1447,14 @@ class MiniMaxH3Pipeline(
         staged = self._uses_manual_component_offload(component)
         try:
             if staged:
-                component.load_to_device()
+                with stage_span("memory/component_load"):
+                    component.load_to_device()
             yield
         except BaseException:
             if staged:
                 try:
-                    component.offload_to_cpu()
+                    with stage_span("memory/component_offload"):
+                        component.offload_to_cpu()
                 except BaseException:
                     logger.exception("Failed to release %s after component failure", component.__class__.__name__)
                 cache = getattr(self, "_dlo_component_cache", None)
@@ -1439,7 +1467,8 @@ class MiniMaxH3Pipeline(
         else:
             if staged:
                 try:
-                    component.offload_to_cpu()
+                    with stage_span("memory/component_offload"):
+                        component.offload_to_cpu()
                 except BaseException:
                     cache = getattr(self, "_dlo_component_cache", None)
                     if cache is not None:
@@ -1498,6 +1527,7 @@ class MiniMaxH3Pipeline(
             self._release_stage_cache()
         return (torch.cat(rows) if rows else None), shapes
 
+    @stage('output/device_to_host')
     def _offload_model_cpu_stage_output(self, tensor: torch.Tensor) -> torch.Tensor:
         """Release a decoded output's storage before a later seed reloads the DiT.
 
@@ -1905,6 +1935,7 @@ class MiniMaxH3Pipeline(
             audio_t=audio_t,
         )
 
+    @stage('vae/streaming_joint_to_mp4')
     def decode_to_mp4(
         self,
         video_latent: torch.Tensor,
@@ -1961,6 +1992,7 @@ class MiniMaxH3Pipeline(
             raise ValueError("MiniMax H3 chunked MP4 encoding currently expects one output per decoder")
         return videos[0]
 
+    @stage('memory/release_cache')
     def _release_stage_cache(self) -> None:
         """Return idle allocator pages to the device at stage boundaries.
 
@@ -1981,6 +2013,7 @@ class MiniMaxH3Pipeline(
             return
         current_omni_platform.empty_cache()
 
+    @stage('vae/normal_joint')
     def decode(
         self,
         video_latent: torch.Tensor,
@@ -2510,6 +2543,7 @@ class MiniMaxH3Pipeline(
         num_outputs = context["num_outputs"]
         videos = []
         audios = []
+        tail_timings = []
         for output_seed in _minimax_h3_output_seeds(context["seed"], num_outputs):
             output_kwargs = {**denoise_kwargs, "seed": output_seed}
             if context.get("continuation") is None:
@@ -2523,6 +2557,9 @@ class MiniMaxH3Pipeline(
                     overlap_frames=overlap_frames,
                     text_conditioning=context.get("continuation_text_conditioning"),
                 )
+            tail_timing = _start_vae_tail(
+                request.request_id, "streaming" if context["preencode_mp4"] else "normal"
+            )
             if context["preencode_mp4"]:
                 videos.append(
                     self.decode_to_mp4(
@@ -2535,6 +2572,8 @@ class MiniMaxH3Pipeline(
                         fps=context["fps"],
                     )
                 )
+                if tail_timing is not None:
+                    tail_timing["end_ns"] = time.monotonic_ns()
                 audios.append(None)
             else:
                 video, audio = self.decode(
@@ -2556,6 +2595,8 @@ class MiniMaxH3Pipeline(
                 del video
                 self._release_stage_cache()
                 audios.append(audio)
+            if tail_timing is not None:
+                tail_timings.append(tail_timing)
         if videos and isinstance(videos[0], bytes):
             video = videos[0] if len(videos) == 1 else videos
             audio = None
@@ -2563,7 +2604,7 @@ class MiniMaxH3Pipeline(
             video = videos[0] if len(videos) == 1 else torch.cat(videos, dim=0)
             audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
         return DiffusionOutput(
-            output=(video, audio),
+            output=(video, audio, tail_timings[0]) if tail_timings else (video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
         )
@@ -2907,6 +2948,9 @@ class MiniMaxH3Pipeline(
             latent_w=shape["latent_w"],
             audio_t=shape["audio_t"],
         )
+        tail_timing = _start_vae_tail(
+            state.request_id, "streaming" if shape.get("preencode_mp4", False) else "normal"
+        )
         if shape.get("preencode_mp4", False):
             video = self.decode_to_mp4(
                 video_latent,
@@ -2917,6 +2961,8 @@ class MiniMaxH3Pipeline(
                 batch_frames=shape.get("preencode_batch_frames", 17),
                 fps=shape.get("fps", MINIMAX_H3_FPS),
             )
+            if tail_timing is not None:
+                tail_timing["end_ns"] = time.monotonic_ns()
             audio = None
         else:
             video, audio = self.decode(
@@ -2928,7 +2974,7 @@ class MiniMaxH3Pipeline(
             video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
             self._release_stage_cache()
         return DiffusionOutput(
-            output=(video, audio),
+            output=(video, audio, tail_timing) if tail_timing is not None else (video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
         )
