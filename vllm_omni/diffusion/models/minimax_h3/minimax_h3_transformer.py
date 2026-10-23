@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -56,6 +57,8 @@ from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelCont
 from vllm_omni.platforms import current_omni_platform
 
 from .attention.mindiesd_h3 import MindIESDH3Parallel
+from .optimization import H3OptimizationConfig
+from .rf_layout import H3RFLayoutAdapter
 from .fasth3 import _resolve_native_target
 
 if TYPE_CHECKING:
@@ -525,6 +528,7 @@ class MiniMaxH3Attention(nn.Module):
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         gate_compress: torch.Tensor | None = None,
+        attention_prefetch_ticket=None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -623,7 +627,14 @@ class MiniMaxH3Attention(nn.Module):
             video_layout=video_layout,
         )
         q_bsnd, k_bsnd, v_bsnd = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
-        out = self._mindiesd_parallel.try_attention(self.attention, q_bsnd, k_bsnd, v_bsnd, metadata)
+        out = self._mindiesd_parallel.try_attention(
+            self.attention,
+            q_bsnd,
+            k_bsnd,
+            v_bsnd,
+            metadata,
+            prefetch_ticket=attention_prefetch_ticket,
+        )
         if out is None:
             out = self.attention(q_bsnd, k_bsnd, v_bsnd, metadata)
         return out.squeeze(0)
@@ -640,6 +651,7 @@ class MiniMaxH3Attention(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        attention_prefetch_ticket=None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -699,6 +711,7 @@ class MiniMaxH3Attention(nn.Module):
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
             gate_compress=gate_compress,
+            attention_prefetch_ticket=attention_prefetch_ticket,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -873,6 +886,16 @@ class MiniMaxH3TokenRefiner(nn.Module):
 
 
 class MiniMaxH3DiTBlock(nn.Module):
+    def qbmm_nz_request_owner(self):
+        """DLO may use NZ only with this owner's shared request agreement."""
+        return self.attn._mindiesd_parallel
+
+    def attention_prefetch_policy(self):
+        return self.attn._mindiesd_parallel.prefetch_policy(self.attn.attention)
+
+    def register_attention_prefetch_ticket(self, ticket):
+        self.attn._mindiesd_parallel.register_prefetch_ticket(ticket)
+
     def __init__(
         self,
         arch: MiniMaxH3DiTArchConfig,
@@ -918,6 +941,8 @@ class MiniMaxH3DiTBlock(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        attention_prefetch_ticket=None,
+        rf_block_layout=None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -926,48 +951,53 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm1 -> scale/shift -> attention -> gated residual, followed by
         norm2 -> scale/shift -> MLP -> gated residual.
         """
-        (
-            shift_msa,
-            scale_msa,
-            gate_msa,
-            shift_mlp,
-            scale_mlp,
-            gate_mlp,
-        ) = self.adaln_proj(t_emb)
+        with attention_prefetch_ticket.scope() if attention_prefetch_ticket is not None else nullcontext():
+            parameters = self.adaln_proj(t_emb)
+            if rf_block_layout is not None:
+                parameters = rf_block_layout.adaln_parameters(parameters)
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+            ) = parameters
 
-        residual = x
-        h = rms_norm_indexed_scale_shift(
-            x,
-            self.norm1.weight,
-            shift_msa,
-            scale_msa,
-            combined_indices,
-            self.norm1.variance_epsilon,
-        )
-        h = self.attn(
-            h,
-            rope_table=rope_table,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            packed_total=packed_total,
-            num_requests=num_requests,
-            sp_seq_lens=sp_seq_lens,
-            video_layout=video_layout,
-            vsa_prefix_segments=vsa_prefix_segments,
-        )
-        x, h = indexed_gate_rms_norm_scale_shift(
-            residual,
-            gate_msa,
-            h,
-            self.norm2.weight,
-            shift_mlp,
-            scale_mlp,
-            combined_indices,
-            self.norm2.variance_epsilon,
-        )
-        residual = x
-        h = self.mlp(h)
-        return indexed_gate(residual, gate_mlp, h, combined_indices)
+            residual = x
+            h = rms_norm_indexed_scale_shift(
+                x,
+                self.norm1.weight,
+                shift_msa,
+                scale_msa,
+                combined_indices,
+                self.norm1.variance_epsilon,
+            )
+            h = self.attn(
+                h,
+                rope_table=rope_table,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                packed_total=packed_total,
+                num_requests=num_requests,
+                sp_seq_lens=sp_seq_lens,
+                video_layout=video_layout,
+                vsa_prefix_segments=vsa_prefix_segments,
+                attention_prefetch_ticket=attention_prefetch_ticket,
+            )
+            x, h = indexed_gate_rms_norm_scale_shift(
+                residual,
+                gate_msa,
+                h,
+                self.norm2.weight,
+                shift_mlp,
+                scale_mlp,
+                combined_indices,
+                self.norm2.variance_epsilon,
+            )
+            residual = x
+            h = self.mlp(h)
+            return indexed_gate(residual, gate_mlp, h, combined_indices)
 
 
 class MiniMaxH3FinalLayer(nn.Module):
@@ -1151,6 +1181,9 @@ class MiniMaxH3DiTModel(nn.Module):
         diffusers_weights: bool | None = None,
     ) -> None:
         super().__init__()
+        self.optimization_config = H3OptimizationConfig.from_env()
+        self.optimization_config.activate()
+        self._rf_layout = H3RFLayoutAdapter()
         tf_config = od_config.tf_model_config
         config_mapping = tf_config.to_dict() if hasattr(tf_config, "to_dict") else dict(tf_config)
         # The native MiniMax-H3 Hub snapshot advertises the Diffusers
@@ -1518,6 +1551,11 @@ class MiniMaxH3DiTModel(nn.Module):
         return embeddings, t_emb
 
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        config = getattr(self, "optimization_config", None)
+        with self._rf_layout.forward_scope(enabled=config is not None and config.rf_layout == "post_embed"):
+            return self._forward_impl(**kwargs)
+
+    def _forward_impl(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         """Packed inference forward.
 
         Keyword names follow the checkpoint's serving contract.
@@ -1567,6 +1605,8 @@ class MiniMaxH3DiTModel(nn.Module):
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
         video_layout = kwargs.get("video_token_layout")
+        rf_enabled = self.optimization_config.rf_layout == "post_embed"
+        block_video_layout = self._rf_layout.block_metadata(video_layout, enabled=rf_enabled)
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -1633,6 +1673,18 @@ class MiniMaxH3DiTModel(nn.Module):
                 block_rope,
                 block_combined,
             )
+        rf_plan = None
+        if rf_enabled and video_layout is not None and video_layout.video_spans:
+            from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+
+            rf_plan = self._rf_layout.prepare(
+                video_layout, seq_len=seq_len, used_len=max_seqlen, device=device, sp=get_sp_group()
+            )
+            hidden, block_rope, block_combined = rf_plan.enter(
+                hidden, block_rope, inverse_indices, token_tags,
+                modality_count=MINIMAX_H3_ADALN_MODALITY_NUM,
+                adaln_rows=unique_timesteps.numel() * MINIMAX_H3_ADALN_MODALITY_NUM,
+            )
         for block in self.blocks:
             hidden = block(
                 hidden,
@@ -1643,9 +1695,12 @@ class MiniMaxH3DiTModel(nn.Module):
                 max_seqlen=max_seqlen,
                 packed_total=seq_len,
                 num_requests=num_requests,
-                video_layout=video_layout,
+                video_layout=block_video_layout,
                 vsa_prefix_segments=vsa_prefix_segments,
+                rf_block_layout=rf_plan,
             )
+        if rf_plan is not None:
+            hidden = rf_plan.restore(hidden)
         if local_len == seq_len:
             hidden = self.sp_gather(hidden)
             video_logits, audio_logits = self.final_layer(
