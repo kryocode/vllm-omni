@@ -21,7 +21,6 @@ once.
 
 from __future__ import annotations
 
-from vllm_omni.diffusion.utils.stage_profiling import stage, stage_span
 import threading
 import time
 from collections import deque
@@ -62,7 +61,6 @@ def _copy_stream(device: torch.device) -> torch.Stream:
         return stream
 
 
-@stage('chunk/quantize')
 def quantize_chunk(chunk: torch.Tensor, value_range: tuple[float, float]) -> torch.Tensor:
     """Quantize a ``BCTHW`` chunk to contiguous ``BTHWC`` uint8 on its own device.
 
@@ -122,7 +120,6 @@ class _HostSlot:
         self._buffer: torch.Tensor | None = None
         self.held_bytes = 0
 
-    @torch.inference_mode(False)
     def reserve(self, frames: torch.Tensor) -> torch.Tensor:
         """Return a host view shaped like ``frames``, growing the buffer if needed."""
         needed = frames.numel()
@@ -171,7 +168,6 @@ class ChunkLease:
         """Whether the copy has landed, without blocking on it."""
         return self._landed is None or self._landed.query()
 
-    @stage('chunk/copy_wait')
     def wait(self) -> np.ndarray:
         """Block until the copy has landed, then hand over the host frames."""
         if self._landed is not None:
@@ -271,7 +267,6 @@ class PinnedChunkRing:
             self._free.append(slot)
             self._slot_freed.notify()
 
-    @stage('chunk/copy_enqueue')
     def _issue_copy(self, host: torch.Tensor, frames: torch.Tensor) -> torch.Event | None:
         if self._stream is None:
             host.copy_(frames)
@@ -287,7 +282,6 @@ class PinnedChunkRing:
             landed.record(self._stream)
         return landed
 
-    @stage('chunk/slot_wait')
     def _acquire(self) -> _HostSlot:
         started = time.perf_counter()
         with self._slot_freed:
@@ -361,7 +355,6 @@ class ChunkedVideoMP4Session:
         if self._pending_frames >= self._batch_frames:
             self._flush()
 
-    @stage('chunk/finish_and_wait')
     def finish(self) -> list[bytes]:
         """Flush what is pending and return one MP4 per batch entry."""
         self._flush()
@@ -405,7 +398,6 @@ class ChunkedVideoMP4Session:
         while self._inflight and self._inflight[0].ready():
             self._feed_lease(self._inflight.popleft())
 
-    @stage('chunk/feed_encoder')
     def _feed_lease(self, lease: ChunkLease) -> None:
         try:
             self._feed(lease.wait(), release=lease.release)

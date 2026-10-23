@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-from vllm_omni.diffusion.utils.stage_profiling import stage, stage_span
 import io
 import queue
 import threading
@@ -170,7 +169,6 @@ class ChunkedMP4Encoder:
         if self._closed:
             raise RuntimeError("ChunkedMP4Encoder is already closed")
 
-    @stage('mp4/queue_push')
     def push(self, chunk: np.ndarray, *, on_consumed: Callable[[], None] | None = None) -> None:
         """Queue a chunk; asynchronous failures surface here or at finish().
 
@@ -192,7 +190,6 @@ class ChunkedMP4Encoder:
     def _send_done(self) -> None:
         self._queue.put(_CHUNKED_MP4_DONE)
 
-    @stage('mp4/finalize_wait')
     def finish(self) -> bytes:
         """Flush the muxer and return complete progressive MP4 bytes."""
         with self._state_lock:
@@ -435,7 +432,6 @@ def mux_video_audio_bytes(
     return buf.getvalue()
 
 
-@stage('mp4/mux_pipeline_including_input_wait')
 def mux_av_video_audio_bytes(
     video_frames: Iterable[av.VideoFrame],
     width: int,
@@ -481,9 +477,8 @@ def mux_av_video_audio_bytes(
             a_stream.layout = layout
 
         for frame in video_frames:
-            with stage_span("mp4/video_frame_encode_and_mux"):
-                for packet in v_stream.encode(frame):
-                    container.mux(packet)
+            for packet in v_stream.encode(frame):
+                container.mux(packet)
         for packet in v_stream.encode():
             container.mux(packet)
 
