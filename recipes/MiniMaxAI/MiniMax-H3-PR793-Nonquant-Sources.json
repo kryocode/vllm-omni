@@ -1,0 +1,38 @@
+{
+  "source_pr": "https://gitcode.com/Ascend/MindIE-SD/pull/793",
+  "source_pr_head": "d405d3646e40d19873e77a921b818d1fa985e60a",
+  "branch": "minimax-h3-pr793",
+  "archive_bases": {
+    "MindIE-SD": "2b67d9d0f2e01ae7b585fa488b1e74b6650cff31",
+    "vllm-omni": "4da2357673a635936575788d9a99cc891b95c254"
+  },
+  "sha256_lf_sources": {
+    "MindIE-SD": {
+      "mindiesd/parallel/__init__.py": "56fc4ffae3becb03f35a968fe5f0956673bcd401d5b9c366a697986bd9175532",
+      "mindiesd/parallel/_comm_pr658_bf16.py": "aa38d61328b2a7acc37e6c6cff5c3a725b645ca4ded148d718a992708dcef00c",
+      "mindiesd/parallel/topology.py": "e5f2d77def61ccc27b25e2e81d57f26c05e0e747756c09db1268ba4c0525f126",
+      "tests/parallel/test_pr793_topology.py": "a54f79afd3d52af239ef60df891c98f9afaa18f525815f4b381d32a2c44bcfe3"
+    },
+    "vllm-omni": {
+      "tests/attention/test_mindiesd_bridge.py": "d6040cb31f08648d3c867f0e4b77aaf59642027704004dd33c7e8bf649b31861",
+      "vllm_omni/diffusion/attention/mindiesd_bridge.py": "ddffba502110119d361a1f3120de7b8e5d5d1e7b3d645ad4041c7181bb25c503",
+      "vllm_omni/diffusion/models/minimax_h3/attention/_mindiesd_h3_legacy.py": "f2c752d050a872b52ae545281d509704241ff957b491dc2db90f8437b5904753",
+      "vllm_omni/diffusion/models/minimax_h3/attention/mindiesd_h3.py": "68c22876326dcbb69b1c09707dc811ba6fa37cd62a02d1fbdd78c4c3d422c0f2",
+      "tests/attention/test_pr793_nonquant_bridge.py": "9aaf68717248277e97c9408120cd6560729beb1b33dd8bfa2c06ed50aaef9596"
+    }
+  },
+  "wire_dtype": "bfloat16",
+  "quantized_transport_imported": false,
+  "quantized_attention_imported": false,
+  "new_dual_stream_implementation": false,
+  "validation": {
+    "sd_cpu_passed": 125,
+    "sd_existing_xfail": 1,
+    "omni_cpu_passed": 191,
+    "omni_subtests_passed": 97,
+    "real_two_rank_gloo": true,
+    "offline_precommit": "passed",
+    "npu_paired_probe": "source transfer awaiting explicit approval",
+    "full_model_video_performance": "not run"
+  }
+}
