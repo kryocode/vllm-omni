@@ -262,8 +262,6 @@ class DiffusionWorker:
         # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
-        from vllm_omni.diffusion.worker.cpu_affinity import bind_worker_cpu
-        bind_worker_cpu(self.local_rank, self.rank, "pre_device")
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
         #   1. explicit od_config.diffusion_model_runner_cls (user override),
@@ -301,7 +299,6 @@ class DiffusionWorker:
         if not skip_load_model:
             self.load_model(load_format=self.od_config.diffusion_load_format)
             self.init_lora_manager()
-        bind_worker_cpu(self.local_rank, self.rank, "post_init")
         logger.info(f"Worker {self.rank}: Initialization complete.")
 
     def init_device(self) -> None:

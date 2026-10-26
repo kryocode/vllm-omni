@@ -649,33 +649,6 @@ class OmniServeCommand(CLISubcommand):
                 'Only args containing "pipeline_class" trigger custom pipeline re-initialization.'
             ),
         )
-        from vllm_omni.diffusion.optimization_config import H3_EXECUTION_OPTIONS
-
-        execution_help = {
-            "diffusion_attn_head_overlap_mode": (
-                "H3 communication: original route or one-head pipeline with prepacked sends and reused output buffers."
-            ),
-            "diffusion_attn_rf_cache_mode": "H3 RF preprocessing: original route or cached static geometry.",
-            "minimax_h3_rf_reorder_mode": (
-                "H3 RF row layout: unchanged, post-embedding redistribution, or pre-embedding row placement. "
-                "Hoisting requires cached RF."
-            ),
-            "diffusion_attn_head_overlap_graph_mode": (
-                "H3 attention graph: off, prefix/body Graph1, or whole-region Graph2. Requires pipeline and cached RF."
-            ),
-            "dlo_allgather_gate_mode": (
-                "H3 DLO AllGather gate. first_head releases after input0 in eager/Graph1; Graph2 releases "
-                "at block end. Requires pipeline and DLO AllGather."
-            ),
-            "dlo_weight_format": (
-                "H3 DLO weight layout: native ND or host-packed NZ. NZ requires eligible NPU INT8 weights "
-                "and DLO AllGather."
-            ),
-        }
-        for name, (choices, default) in H3_EXECUTION_OPTIONS.items():
-            omni_config_group.add_argument(
-                "--" + name.replace("_", "-"), choices=choices, default=default, help=execution_help[name]
-            )
         omni_config_group.add_argument(
             "--usp",
             "--ulysses-degree",

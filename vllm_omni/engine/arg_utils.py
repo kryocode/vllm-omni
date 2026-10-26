@@ -603,12 +603,6 @@ class OrchestratorArgs:
     dlo_host_registration_limit_gib: float = 0.0
     boundary_ratio: float | None = None
     flow_shift: float | None = None
-    diffusion_attn_head_overlap_mode: str = "legacy"
-    diffusion_attn_rf_cache_mode: str = "native"
-    minimax_h3_rf_reorder_mode: str = "none"
-    diffusion_attn_head_overlap_graph_mode: str = "off"
-    dlo_allgather_gate_mode: str = "off"
-    dlo_weight_format: str = "nd"
     diffusion_kv_cache_dtype: str | None = None
     diffusion_kv_cache_skip_steps: str | None = None
     diffusion_kv_cache_skip_layers: str | None = None

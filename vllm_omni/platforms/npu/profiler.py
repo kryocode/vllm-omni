@@ -48,18 +48,12 @@ class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
             elif activity == "NPU":
                 npu_activities.append(torch_npu.profiler.ProfilerActivity.NPU)
 
-        level = profiler_config.torch_profiler_npu_level
-
         # NPU-specific experimental config for detailed profiling
         experimental_config = torch_npu.profiler._ExperimentalConfig(
             export_type=torch_npu.profiler.ExportType.Text,
-            profiler_level=getattr(torch_npu.profiler.ProfilerLevel, level),
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
             msprof_tx=False,
-            aic_metrics=(
-                torch_npu.profiler.AiCMetrics.AiCoreNone
-                if level == "Level0"
-                else torch_npu.profiler.AiCMetrics.PipeUtilization
-            ),
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
             l2_cache=False,
             op_attr=False,
             data_simplification=True,
