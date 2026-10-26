@@ -458,6 +458,12 @@ class StageDeployConfig:
     diffusion_attention_backend: str | None = None
     fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: dict[str, Any] | None = None
+    diffusion_attn_head_overlap_mode: str | None = None
+    diffusion_attn_rf_cache_mode: str | None = None
+    minimax_h3_rf_reorder_mode: str | None = None
+    diffusion_attn_head_overlap_graph_mode: str | None = None
+    dlo_allgather_gate_mode: str | None = None
+    dlo_weight_format: str | None = None
 
     # Diffusion execution, cache, and VAE behavior.
     diffusion_compile_granularity: str | None = None

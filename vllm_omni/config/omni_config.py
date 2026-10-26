@@ -884,6 +884,13 @@ class _DiffusionConfigProjection:
     override_transformer_cls_name: str | None = None
     worker_extension_cls: str | None = None
     custom_pipeline_args: dict[str, Any] | None = None
+    # Serialized with the diffusion stage and delivered to every model worker.
+    diffusion_attn_head_overlap_mode: str = "legacy"
+    diffusion_attn_rf_cache_mode: str = "native"
+    minimax_h3_rf_reorder_mode: str = "none"
+    diffusion_attn_head_overlap_graph_mode: str = "off"
+    dlo_allgather_gate_mode: str = "off"
+    dlo_weight_format: str = "nd"
     additional_config: dict[str, Any] = field(default_factory=dict)
     kv_transfer_config: KVTransferConfig | None = None
     enable_stage_verification: bool = True
@@ -1028,6 +1035,10 @@ class _DiffusionConfigProjection:
                 "diffusers_load_kwargs and diffusers_call_kwargs are only "
                 "valid together with diffusion_load_format=diffusers"
             )
+
+        from vllm_omni.diffusion.optimization_config import validate_h3_execution_options
+
+        validate_h3_execution_options(self)
 
     def _propagate_quantization_from_tf_config(self, tf_config: Any) -> None:
         quant_config = getattr(tf_config, "quant_config", None)

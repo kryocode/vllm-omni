@@ -1044,6 +1044,13 @@ class OmniDiffusionConfig:
     # Native vLLM KV connector configuration. PR0 only assembles the connector;
     # the native page data path is owned by the follow-up landing PR.
     kv_transfer_config: "KVTransferConfig | None" = None
+    # Serialized with the diffusion stage and delivered to every model worker.
+    diffusion_attn_head_overlap_mode: str = "legacy"
+    diffusion_attn_rf_cache_mode: str = "native"
+    minimax_h3_rf_reorder_mode: str = "none"
+    diffusion_attn_head_overlap_graph_mode: str = "off"
+    dlo_allgather_gate_mode: str = "off"
+    dlo_weight_format: str = "nd"
     additional_config: dict[str, Any] = field(default_factory=dict)
 
     profiler_config: "ProfilerConfig | dict[str, Any] | None" = None
@@ -1380,6 +1387,10 @@ class OmniDiffusionConfig:
                     model_id,
                     self.model,
                 )
+
+        from vllm_omni.diffusion.optimization_config import validate_h3_execution_options
+
+        validate_h3_execution_options(self)
 
     @property
     def is_single_file(self) -> bool:
