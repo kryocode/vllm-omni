@@ -18,10 +18,10 @@ This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import weakref
-import os
 from collections.abc import Sequence
 from itertools import chain
 from typing import Any
@@ -154,8 +154,20 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             raise ValueError("rank_local_mmap requires dp_size=1")
 
         self.next_block = next_block
-        self._qbmm_nz_requested = qbmm_nz
-        self._qbmm_nz_env = os.environ.get('MINDIESD_QBMM_NZ', '0')
+        owner_factory = getattr(next_block, "qbmm_nz_request_owner", None)
+        # DiT offload groups also contain refiner blocks without the H3 NZ
+        # protocol. Keep those blocks ND and exclude them from NZ contracts.
+        self._qbmm_nz_requested = qbmm_nz and owner_factory is not None
+        if self._qbmm_nz_requested and not callable(owner_factory):
+            raise RuntimeError("QBMM NZ H3 request owner protocol must be callable")
+        owner = owner_factory() if self._qbmm_nz_requested else None
+        config = getattr(owner, "optimization_config", None)
+        self._qbmm_nz_config = config if config is not None and config.isolated else None
+        self._qbmm_nz_env = (
+            self._qbmm_nz_config.value("MINDIESD_QBMM_NZ")
+            if self._qbmm_nz_config is not None
+            else os.environ.get("MINDIESD_QBMM_NZ", "0")
+        )
         self._qbmm_nz_plan = None
         self.device = device
         self.dp_group = dp_group
@@ -303,17 +315,17 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         if self._qbmm_nz_requested:
             selected = tuple(
-                (meta['name'], meta['offset'], tuple(meta['shape']), tuple(meta['stride']))
+                (meta["name"], meta["offset"], tuple(meta["shape"]), tuple(meta["stride"]))
                 for metas in self.metadata.values()
                 for meta in metas
-                if meta.get('qbmm_nz')
+                if meta.get("qbmm_nz")
             )
             # The H3 shared request boundary hashes this alongside its existing
             # attention policy. No rank may exchange a mixed ND/NZ weight shard.
-            self.next_block._mindiesd_qbmm_nz_contract = ('qbmm_nz_v1', self._qbmm_nz_env, selected)
+            self.next_block._mindiesd_qbmm_nz_contract = ("qbmm_nz_v1", self._qbmm_nz_env, selected)
             if self._qbmm_nz_plan is not None:
                 self._qbmm_nz_plan.contract = self.next_block._mindiesd_qbmm_nz_contract
-                logger.info('MindIE QBMM NZ block setup: %s', self._qbmm_nz_plan.stats())
+                logger.info("MindIE QBMM NZ block setup: %s", self._qbmm_nz_plan.stats())
 
         # Pre-compute AG output sizes (avoid sum() per layer).
         self._ag_output_sizes: dict[torch.dtype, int] = {}
@@ -432,7 +444,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 entry = tensor_storage_metadata(spec, current_offset)
                 is_nz = qbmm_nz_plan is not None and qbmm_nz_plan.describe(spec.name, spec.value, offset=current_offset)
                 if is_nz:
-                    entry['qbmm_nz'] = True
+                    entry["qbmm_nz"] = True
                 dtype_metadata.setdefault(dtype, []).append(entry)
 
                 # Copy ONLY the portion within [shard_start, shard_end)
@@ -589,9 +601,15 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         double-buffer memory bound (exactly 2 blocks on device).
         """
         if self._ticket_failed:
-            raise RuntimeError('Failed prefetch hook: recreate the participating workers')
-        if getattr(self, '_qbmm_nz_requested', False) and os.environ.get('MINDIESD_QBMM_NZ', '0') != self._qbmm_nz_env:
-            raise RuntimeError('QBMM NZ setup layout changed; restart workers before prefetch')
+            raise RuntimeError("Failed prefetch hook: recreate the participating workers")
+        config = getattr(self, "_qbmm_nz_config", None)
+        nz_policy = self._qbmm_nz_env if getattr(self, "_qbmm_nz_requested", False) else None
+        if getattr(self, "_qbmm_nz_requested", False):
+            nz_policy = (
+                config.value("MINDIESD_QBMM_NZ") if config is not None else os.environ.get("MINDIESD_QBMM_NZ", "0")
+            )
+        if getattr(self, "_qbmm_nz_requested", False) and nz_policy != self._qbmm_nz_env:
+            raise RuntimeError("QBMM NZ setup layout changed; restart workers before prefetch")
         previous = self._slot_tickets[slot]
         if previous is not None:
             previous.retire()
@@ -599,14 +617,14 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.ready_events[slot] = None
         self._slot_tickets[slot] = None
         self._prefetch_done = None
-        policy = policy or PrefetchGatePolicy(False, None, None, 'materialization')
+        policy = policy or PrefetchGatePolicy(False, None, None, "materialization")
         if policy.defer and (self.dp_size <= 1 or self.dp_group is None):
-            raise RuntimeError('Rank-local weight prefetch cannot promise a deferred AllGather')
+            raise RuntimeError("Rank-local weight prefetch cannot promise a deferred AllGather")
         gpu_weights = self.gpu_buffers[slot]
         assert gpu_weights is not None, f"gpu_buffers[{slot}] not allocated"
-        nz_plan = getattr(self, '_qbmm_nz_plan', None)
+        nz_plan = getattr(self, "_qbmm_nz_plan", None)
         if nz_plan is not None and nz_plan.transport_group is not self.dp_group:
-            raise RuntimeError('QBMM NZ DLO process group changed after setup')
+            raise RuntimeError("QBMM NZ DLO process group changed after setup")
         nz_targets = (
             set()
             if nz_plan is None
@@ -753,7 +771,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
     @torch.compiler.disable
     def restore_next_block_to_cpu(self) -> None:
-        nz_plan = getattr(self, '_qbmm_nz_plan', None)
+        nz_plan = getattr(self, "_qbmm_nz_plan", None)
         if nz_plan is None:
             return self._restore_next_block_to_cpu()
         # A successful drain is mandatory before releasing a raw-pointer owner.
@@ -788,11 +806,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 flat = self.cpu_shards[dtype]
                 for meta in metas:
                     raw = flat[meta["offset"] : meta["offset"] + meta["numel"]]
-                    nz_plan = getattr(self, '_qbmm_nz_plan', None)
+                    nz_plan = getattr(self, "_qbmm_nz_plan", None)
                     value = (
-                        nz_plan.restore(meta['name'], raw)
-                        if meta.get('qbmm_nz')
-                        else torch.as_strided(raw, size=meta['shape'], stride=meta['stride'])
+                        nz_plan.restore(meta["name"], raw)
+                        if meta.get("qbmm_nz")
+                        else torch.as_strided(raw, size=meta["shape"], stride=meta["stride"])
                     )
                     target = (
                         self.next_block_parameters[meta["name"]]
@@ -808,20 +826,20 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             raise RuntimeError("Cannot restore distributed offload weights without the DLO process group")
         self.prefetch_layer(0, non_blocking=False)
         current_omni_platform.synchronize()
-        nz_plan = getattr(self, '_qbmm_nz_plan', None)
+        nz_plan = getattr(self, "_qbmm_nz_plan", None)
         for dtype, metas in self.metadata.items():
             for meta in metas:
                 target = (
-                    self.next_block_parameters[meta['name']]
-                    if meta['name'] in self.next_block_parameters
-                    else self.next_block_buffers[meta['name']]
+                    self.next_block_parameters[meta["name"]]
+                    if meta["name"] in self.next_block_parameters
+                    else self.next_block_buffers[meta["name"]]
                 )
-                if meta.get('qbmm_nz'):
-                    raw = self.gpu_buffers[0][dtype][meta['offset'] : meta['offset'] + meta['numel']].cpu()
-                    local = nz_plan.restore(meta['name'], raw)
+                if meta.get("qbmm_nz"):
+                    raw = self.gpu_buffers[0][dtype][meta["offset"] : meta["offset"] + meta["numel"]].cpu()
+                    local = nz_plan.restore(meta["name"], raw)
                 else:
-                    local = target.to_local() if hasattr(target, 'to_local') else target
-                restore_tensor_storage(target, local, device='cpu')
+                    local = target.to_local() if hasattr(target, "to_local") else target
+                restore_tensor_storage(target, local, device="cpu")
                 if nz_plan is not None:
                     nz_plan.release_target(target)
 
@@ -840,10 +858,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
     def _pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
         if self._ticket_failed:
-            raise RuntimeError('Failed prefetch hook cannot be reused')
+            raise RuntimeError("Failed prefetch hook cannot be reused")
         previous = self._invocation_ticket
         if previous is not None:
-            raise RuntimeError('Previous block prefetch invocation is still live or failed')
+            raise RuntimeError("Previous block prefetch invocation is still live or failed")
         # Dynamic slot tracking: read current_slot from the previous hook's
         # _prefetched_slot (the slot where this block's data was actually
         # loaded).  This corrects the initial i%2 assignment for odd block
@@ -877,19 +895,19 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # waits for weights before reading them.  The redundant wait_event
         # caused cascading NPU stream synchronization stalls (~10ms/layer).
         next_slot = 1 - self.current_slot
-        protocol = getattr(module, 'attention_prefetch_policy', None)
-        policy = protocol() if callable(protocol) else PrefetchGatePolicy(False, None, None, 'no block protocol')
+        protocol = getattr(module, "attention_prefetch_policy", None)
+        policy = protocol() if callable(protocol) else PrefetchGatePolicy(False, None, None, "no block protocol")
         if policy.defer and self.dp_size <= 1:
-            policy = PrefetchGatePolicy(False, policy.request_id, policy.consumer_id, 'rank-local weights')
+            policy = PrefetchGatePolicy(False, policy.request_id, policy.consumer_id, "rank-local weights")
         ticket = self.prefetch_layer(next_slot, non_blocking=True, policy=policy)
         self._invocation_ticket = ticket
         if callable(protocol):
             try:
-                register = getattr(module, 'register_attention_prefetch_ticket', None)
+                register = getattr(module, "register_attention_prefetch_ticket", None)
                 if callable(register):
                     register(ticket)
                 elif policy.defer:
-                    raise RuntimeError('Deferred block protocol requires request-lifetime ticket registration')
+                    raise RuntimeError("Deferred block protocol requires request-lifetime ticket registration")
                 kwargs = dict(kwargs, attention_prefetch_ticket=ticket)
             except BaseException as error:
                 ticket.abort(error)
@@ -914,9 +932,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         """Read existing host counters; NZ bindings do not count compute kernels."""
         plan = self._qbmm_nz_plan
         return {
-            'prefetch': dict(self.prefetch_counters),
-            'failed': self._ticket_failed,
-            'nz': None if plan is None else plan.stats(),
+            "prefetch": dict(self.prefetch_counters),
+            "failed": self._ticket_failed,
+            "nz": None if plan is None else plan.stats(),
         }
 
 
@@ -1662,7 +1680,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     rank_local_mmap=self._using_rank_local_mmap if use_dit_mmap else False,
                     tensor_transforms=self._mmap_transforms_by_tensor_id if use_dit_mmap else None,
                     materialization_probe_tensor=probes[id(block)],
-                    qbmm_nz=component == DIT_COMPONENT,
+                    qbmm_nz=(component == DIT_COMPONENT and getattr(self.config, "dlo_weight_format", "nd") == "nz"),
                 )
             )
 
@@ -2075,8 +2093,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # reconstruct weights with collectives on a potentially failed group.
         for hook in chain.from_iterable(self._all_hook_groups):
             for ticket in (*hook._slot_tickets, hook._invocation_ticket):
-                if ticket is not None and ticket.state not in ('RELEASED', 'RETIRED'):
-                    ticket.abort(RuntimeError('Offload backend disabled with unresolved prefetch'))
+                if ticket is not None and ticket.state not in ("RELEASED", "RETIRED"):
+                    ticket.abort(RuntimeError("Offload backend disabled with unresolved prefetch"))
                     hook._ticket_failed = True
             if hook._ticket_failed:
                 restore_allgather_weights = False

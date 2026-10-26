@@ -70,6 +70,7 @@ class OffloadConfig:
     # blocks from the loader-selected host backing with H2D only.
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0  # leading DiT layers kept on device
+    dlo_weight_format: str = "nd"
     # Optional per-worker ceiling for registering an HWR mmap. Zero means no
     # additional ceiling; pin_cpu_memory controls whether registration is tried.
     dlo_host_registration_limit_gib: float = 0.0
@@ -209,6 +210,7 @@ class OffloadConfig:
             dp_size=dp_size,
             dlo_use_allgather=dit_uses_allgather,
             dlo_resident_layers=dlo_resident_layers,
+            dlo_weight_format=getattr(od_config, "dlo_weight_format", "nd"),
             dlo_host_registration_limit_gib=dlo_host_registration_limit_gib,
             components=components,
             dlo_transfers=dlo_transfers,
