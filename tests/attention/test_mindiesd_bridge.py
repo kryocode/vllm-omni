@@ -180,6 +180,11 @@ def env(monkeypatch):
     parallel.AttentionExecutor = Executor
     parallel.distributed_attention = legacy
     parallel.input_gate_supported = lambda: True
+    parallel.rank_window = lambda rank, world, local, used: (
+        rank * local,
+        max(rank * local, min((rank + 1) * local, used)),
+        min(local, max(0, used - rank * local)),
+    )
     package("mindiesd.layers")
     package("mindiesd.layers.flash_attn")
     geometry = package("mindiesd.layers.flash_attn.rf_geometry")

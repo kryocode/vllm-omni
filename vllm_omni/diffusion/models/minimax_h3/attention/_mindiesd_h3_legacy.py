@@ -208,6 +208,10 @@ class MindIESDH3Parallel:
             return attention._run_local_attention(q, k, v, local_metadata)
 
         parallel = _mindiesd_module("parallel")
+        window_fn = getattr(parallel, "rank_window", None)
+        if not callable(window_fn):
+            raise RuntimeError("H3 BF16 transport requires the paired MindIE-SD rank_window API")
+        _, _, local_used = window_fn(rank, world, query.shape[1], used_len)
         if self.state is None:
             self.state = parallel.ParallelState(group=group)
             if self.overlap:
@@ -247,7 +251,6 @@ class MindIESDH3Parallel:
         )
         if output.shape != query.shape or output.dtype != query.dtype or output.device != query.device:
             raise RuntimeError("MindIE-SD attention did not restore local BSND layout.")
-        local_used = min(query.shape[1], max(0, used_len - rank * query.shape[1]))
         if local_used < query.shape[1]:
             output[:, local_used:].copy_(query[:, local_used:])
         if self.verify_first:

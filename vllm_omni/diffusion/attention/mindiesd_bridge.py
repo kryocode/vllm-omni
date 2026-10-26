@@ -55,6 +55,7 @@ class AttentionBridge:
         self.agreements = 0
         self._execution_policy = None
         self._graph_requested = False
+        self.local_sequence_window = None
 
     def prepare_request(self, plan_id, contract, *, group, device, candidate=True, stream=None, graph_requested=False):
         """Agree once on a shared request boundary using fixed-size metadata.
@@ -73,6 +74,8 @@ class AttentionBridge:
             self.failed = True
             raise RuntimeError("Attention transport group/device context cannot change")
         parallel = import_module("mindiesd.parallel")
+        window_fn = getattr(parallel, "rank_window", None)
+        candidate = bool(candidate and callable(window_fn))
         if self.state is None:
             self.state = parallel.TransportState(group=group, stream=stream)
             if self.overlap:
@@ -136,6 +139,9 @@ class AttentionBridge:
             raise RuntimeError("Attention request rank agreement failed: route/config/contract differ")
         self.contract, self.group = contract, group
         self.prepared, self.accepted = True, bool(rows[0][0])
+        self.local_sequence_window = (
+            window_fn(context[2], world, contract.shape[1], contract.used_len) if self.accepted else None
+        )
         self._execution_policy = execution_policy
         self._graph_requested = graph_requested
         if policy_error is not None:
@@ -205,3 +211,4 @@ class AttentionBridge:
         self.group = None
         self._execution_policy = None
         self._graph_requested = False
+        self.local_sequence_window = None

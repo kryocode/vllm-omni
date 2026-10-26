@@ -585,9 +585,8 @@ class MindIESDH3Parallel:
             on_input_chunk_ready=callback,
             graph_signature=graph_signature,
         )
-        rank = dist.get_rank(self._bridge.group)
         used = self._bridge.contract.used_len
-        local_used = min(query.shape[1], max(0, used - rank * query.shape[1]))
+        _, _, local_used = self._bridge.local_sequence_window
         if local_used < query.shape[1]:
             output[:, local_used:].copy_(query[:, local_used:])
         if self.verify_first:
