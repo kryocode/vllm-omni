@@ -1,109 +1,149 @@
-# MiniMax H3 PR793 non-quantized integration
+# PR793 non-quantized branch after removing the custom optimization stack
 
-Use branch `minimax-h3-pr793` in both `kryocode/vllm-omni` and
-`kryocode/MindIE-SD`. It starts from archived H3 optimizations at
-omni `4da23576` and MindIE-SD `2b67d9d`.
+Use `minimax-h3-pr793` in both repositories. The original
+`minimax-h3-u8-refactor-20261022` branches are preserved without changes.
+Earlier paired-probe results from the inherited optimization stack do not
+validate this replacement implementation.
 
-The reviewed source is [MindIE-SD PR793](https://gitcode.com/Ascend/MindIE-SD/pull/793)
-at `d405d3646e40d19873e77a921b818d1fa985e60a`.
+The clean source bases are MindIE-SD `39950728895b3f00a8cbe641a5329705e73dfaac`
+and vllm-omni `7149a6d4551caaba138b63f413e3d197d01bd16a`.
+Original native H3/RF support remains. Only the PR793 adaptation and its
+necessary integration differ from these bases.
 
-## Included changes
+Source: [Ascend/MindIE-SD PR793](https://gitcode.com/Ascend/MindIE-SD/pull/793),
+reviewed head `d405d3646e40d19873e77a921b818d1fa985e60a`.
+This is a BF16 adaptation of its non-quantized mechanisms, not an unmodified
+copy of its quantized pipeline.
 
-- MindIE-SD centralizes the reverse-A2A cut/merge pair in `parallel/topology.py`
-  and exports the non-quantized `rank_window` helper.
-- The prepared omni bridge resolves the local valid sequence window once
-  through that helper after rank-common route agreement. H3 restores padding
-  using the recorded valid-row count and clears the window at request end.
-- Missing helper support prevents entry to the prepared attention route through
-  the existing agreement. The legacy caller checks it before data collectives.
-- Existing BF16 head partitioning, send prepacking, output views, RF geometry
-  caching, Graph variants, DLO gating and NZ support remain on the archived path.
-- Tests cover partial and fully padded shards, reverse layout round trips,
-  view storage sharing, the paired API and request lifecycle.
+## Retained PR793 mechanisms
 
-## Excluded changes
+| Mechanism | Current implementation |
+| --- | --- |
+| Per-head A2A chain | Current-stream Q/K/V A2A, BF16 attention, output A2A, then next chunk. One head per destination per chunk. |
+| Send prepacking | Prepare contiguous Q/K/V sends before entering the chunk loop. |
+| Direct output destination | Inverse RF gather writes directly into the payload view of the reverse-A2A buffer. Each chunk owns a fresh padded buffer. |
+| Layout transforms | Adjacent reverse-A2A split/merge helpers, including the contiguous batch=width=1 view fast path. |
+| Rank window | Shared valid-row count; omni restores the original query padding, including fully padded ranks. |
+| Static geometry | Caller-owned permutation, inverse, dense and first-frame block sets, reused for identical spans/length/device. Bounded FIFO of four plans. |
+| Persistent owner | One model-owned state shared by DiT layers; group/rank/device validation, transport-plan reuse and failure/reentry protection. |
 
-The PR793 quantized entry, Q/K INT8 and V FP8 payloads, scale AllReduce,
-boundary quantization repair, quantized packet/pooling protocol, quantizer
-workspaces and quantized BSA consumer are excluded. This does not disable
-the separately configured existing Transformer INT8 linear layers.
+Q/K/V, pooling results, scores and masks are recomputed from current BF16
+inputs. No quantized payload, scale AllReduce, boundary repair, quantized
+packet or quantized attention consumer is imported. Existing unrelated
+Transformer linear quantization and native DLO features stay at the clean base.
 
-No new communication/compute scheduler is implemented. The original archive's
-optional BF16 dual-stream route remains inherited; this port does not change
-its collective order, stream policy or event behavior. New overlap work waits
-for the user's decision.
+## Removed custom features
 
-## Validation scope
+- Side communication stream, lookahead/event overlap and first-head handoff.
+- Graph1/Graph2 capture/replay and associated stable buffer caches.
+- Custom DLO AllGather tickets/gating, NZ weight ownership and packing.
+- post_embed/pre_embed row hoisting and original-rank AdaLN synchronization.
+- Custom RFGeometryCache facade, stream/version-checked geometry cache and
+  CPU geometry construction enhancements from the previous branch.
+- The six custom CLI optimization controls, old H3 overlap adapters, Wan
+  integration and their archived patch bundles/tests/documentation.
 
-MindIE-SD CPU verification: 125 passed, one existing xfail, including actual
-two-process Gloo A2A parity. Omni CPU verification: 191 passed and 97
-subtests passed. New tests first failed before the paired implementation.
+Removing those custom features does not remove original upstream support
+already present at the stated clean bases. Native RF pooling and mask math
+are unchanged; the new consumer calls those original library functions.
 
+## Paired enablement
 
-The isolated paired NPU probe passed on physical devices 2/3 using real
-HCCL A2A and the native BF16 RainFusion consumer. Two datasets for each of
-used lengths 1024 and 256 matched the independent full-sequence per-head
-reference bitwise on both ranks, including a fully padded rank. Each rank
-issued 16 BF16 A2A operations per geometry and zero quantization AllReduce.
-The probe disabled overlap and Graph to isolate this integration's behavior.
+Set `VLLM_OMNI_MINIMAX_H3_PR793_NONQUANT=1` on every worker before startup.
+The default is 0. Old custom optimization flags no longer select this route.
+The adapter supports A2/A3 NPU, BF16 full-query multi-span RF, one packed
+request and strict Ulysses without ring/context/allgather hybrid parallelism.
+Dense RF phases retain the original framework route. Sparse rank signatures
+must agree before attention data A2A. Unsupported requested cases raise.
+A5 and quantized attention require their original framework configuration
+with this new route disabled. No double-stream implementation is added.
 
-This small carrier binds the real process group through an adapter and fixes
-the RF plan; it does not initialize the full H3 pipeline or load model weights.
-The 57 deployed files were checked: 56 are byte-identical after LF normalization;
-topology.py differs only in formatting, with identical Python AST. The isolated
-wheel needed its original mindiesd.libs directory on the child library path.
-Copied omni version metadata emitted a vLLM version mismatch warning, so this
-probe does not establish full-model dependency compatibility. Full H3/video
-correctness and performance remain untested. No speedup claim is made.
+## Validation
+
+- CPU: MindIE-SD 9 passed, including actual two-rank Gloo BF16 communication,
+  head placement, batch 1/2, partial/empty padding, serial collective order,
+  failure-state rejection and bounded cache tests.
+- CPU: omni 8 passed, covering admission, shared ownership, padding, dense
+  routing, rank disagreement, quantized-attention rejection and old flags.
+- New paired NPU validation passed on physical cards 2/3: real HCCL A2A,
+  native BF16 RF, used lengths 1024/256 with two datasets each. Both ranks
+  matched the independent native per-head reference bitwise, including
+  partial and fully padded shards. Each geometry issued 16 BF16 A2As
+  per rank and zero quantization AllReduce; two static plans were reused.
+  The carrier fixes small RF plans and binds a real process group without
+  constructing the full H3 pipeline. All 25 deployed source/probe files
+  match current normalized source hashes. Prior results are superseded.
+- The isolated wheel uses original mindiesd.libs through child-only
+  LD_LIBRARY_PATH. Copied omni version metadata warns about a vLLM
+  version mismatch; full-model dependency compatibility is not established.
+- Full model weights, complete H3 video, output MD5 and performance are not run.
+
+The change restores baseline sources and replaces the inherited stack. New
+adaptation code was implemented before the new CPU tests were recorded;
+there is no test-first failure record for this cleanup revision. No performance
+claim is made. Static validation covers new code and baseline-source identity.
 
 ## Review draft
 
-PR title: `[Refactor][minimax-h3]Reuse non-quantized PR793 shard topology`
+PR title: `[Refactor][parallel]Isolate PR793 BF16 subset from custom H3 optimizations`
 
 ### Which issue(s) this PR fixes or accomplishes
 
-Issue: pending. Selectively integrate non-quantized topology contracts from
-MindIE-SD PR793 into the paired H3 feature branches.
+Issue: pending. Remove the custom optimization stack from the paired PR793
+branches while preserving the original archive branches.
 
 ### Purpose
 
-Use one library-owned shard-window definition for framework padding and retain
-the tested BF16 execution path. Reject mismatched library capability before
-attention data collectives. Quantized transport and attention are excluded.
+Keep a reviewable current-stream BF16 adaptation of PR793 and a thin H3 adapter.
+Exclude quantized communication/attention and the independent custom stack.
 
 ### Test Plan
 
-Run topology/window contracts, paired bridge lifecycle tests and existing
-RF/Graph/DLO CPU regressions. Check real two-rank Gloo layout parity.
+Verify clean-base source identity, serial BF16 collective order, head mapping,
+padding, owner lifetime and rank agreement. Run a paired native RF NPU probe.
 
 ### Test Report
 
-SD: 125 passed, one existing xfail. Omni: 191 passed and 97 subtests passed.
-Paired two-card BF16 HCCL/RF probe passed bitwise; full H3/video/performance not run.
+SD: 9 CPU tests passed. Omni: 8 CPU tests passed. New two-card native BF16 RF/HCCL probe passed bitwise.
+Full-model/video/performance tests are outside this result.
 
-## Minimal-cost overlap proposal (analysis only)
+## Minimal-change dual-stream proposal (not implemented)
 
-The paired branch already inherits a BF16 dual-stream executor. Reusing it
-costs less than adding a second scheduler to PR793's quantized pipeline:
+Keep the existing serial implementation as the default and add one optional
+side-stream schedule around the same BF16 buffers and consumer. No RF math,
+geometry, packet format, Graph, DLO or NZ change is needed.
 
-- `TransportState.make_stream()` owns one persistent communication stream.
-- `Transport.issue()` submits Q/K/V A2A on that stream and records input-ready
-  events; the compute stream waits only for the head it consumes.
-- The next head's input exchanges are queued before the current head's
-  reverse-A2A dependency wait. Otherwise that wait can serialize the pipeline.
-- Compute-complete and reverse-complete events protect the output exchange
-  and final assembly. `record_stream` and retained send buffers protect storage.
+| File | Proposed change |
+| --- | --- |
+| SD `parallel/state.py` | Lazily own one communication stream per live group/device; retain a fixed scheduling policy for this owner. |
+| SD `parallel/comm.py` | Extract input issue, add input-ready/compute-done/output-ready events, prefetch exactly one next head, defer reverse-output assembly to the end. |
+| SD `parallel/pipeline.py` | Pass the owner's stream/policy when constructing a cached Transport. Existing prepack and BF16 RF consumer stay unchanged. |
+| Omni `attention/pr793_nonquant.py` | Pass one opt-in overlap flag and include it in rank agreement; keep serial selection for A/B validation. |
 
-The framework selects the prepared pipeline and provides the native BF16 RF
-consumer; scheduling belongs in MindIE-SD. No framework-side duplicate stream
-or communicator should be added. Begin any future overlap evaluation with
-Graph and weight gating disabled, then compare the existing single-stream and
-side-stream modes with identical inputs and inspect the device timeline.
-Stream counters establish route selection, not actual concurrent execution.
+At entry, the communication stream waits once for prepacked inputs produced
+on the compute stream. The input0 exchange is issued first. The compute
+stream waits for each head's input-ready event and submits its RF work.
+Before enqueueing that head's output wait/A2A, issue the next head's Q/K/V
+A2A. That order lets next-input communication overlap current RF and avoids
+putting the next input behind a compute dependency it does not need.
 
-If an independent PR793-based executor is required later, the smallest design
-is to adapt that same persistent-stream/event schedule around its chunk loop,
-keeping quantization excluded. It also needs lifetime, collective-order,
-padding and paired-rank tests. Graph capture and buffer reuse across in-flight
-heads require separate validation; a single reused send buffer is unsafe.
-This proposal adds no scheduler code and awaits the user's decision.
+Do not add a compute-stream wait to every next-input issue: all sends were
+already prepacked. Do not keep the current per-head output assembly wait
+inside the compute loop: it would prevent the next head's RF from overlapping
+the prior output A2A. Store reverse receive buffers/events and assemble only
+after all heads' RF work has been submitted.
+
+Use record_stream and explicit buffer/event ownership for tensors crossing
+streams. Keep the existing separate padded send buffer for every in-flight
+head. All attention A2As must be issued by the same communication stream on
+each rank, with identical rank-wide collective order. The schedule adds
+temporary buffer residency, including deferred output receives; its memory
+cost must be measured. A blanket async_op change alone is insufficient.
+
+The production change is expected to touch these four files, with most code
+in comm.py (roughly 100-160 added/changed lines overall, excluding tests;
+an estimate, not a fixed budget). First validate serial/overlap bitwise parity
+on the current small HCCL/RF probe, changed inputs, padding and repeated
+calls. Then use an exclusive-device timeline to establish concurrent RF/A2A
+execution and measure net latency. Stream creation/counters alone do not
+prove overlap or speedup. Implementation awaits the user's decision.
