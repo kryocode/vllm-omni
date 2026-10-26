@@ -32,7 +32,99 @@
     "omni_subtests_passed": 97,
     "real_two_rank_gloo": true,
     "offline_precommit": "passed",
-    "npu_paired_probe": "source transfer awaiting explicit approval",
+    "npu_paired_probe": {
+      "status": "passed",
+      "date": "2026-10-26",
+      "physical_devices": [
+        2,
+        3
+      ],
+      "transport": "real HCCL AllToAll",
+      "consumer": "native BF16 RainFusion",
+      "scope": "paired H3 attention adapter with fixed tiny RF plans and process-group carrier; not full model",
+      "graph_and_overlap": "disabled in probe; production scheduling unchanged",
+      "source_verification": {
+        "verified_files": 57,
+        "exact_matches": 56,
+        "ast_equivalent_formatting_only": [
+          "overlay/MindIE-SD/mindiesd/parallel/topology.py"
+        ]
+      },
+      "results": [
+        {
+          "rank": 0,
+          "results": [
+            {
+              "used_len": 1024,
+              "local_window": [
+                0,
+                520,
+                520
+              ],
+              "datasets": 2,
+              "bitwise_equal": true,
+              "a2a": 16,
+              "quantization_allreduce": 0,
+              "wire_dtype": "bfloat16",
+              "single_stream": true
+            },
+            {
+              "used_len": 256,
+              "local_window": [
+                0,
+                256,
+                256
+              ],
+              "datasets": 2,
+              "bitwise_equal": true,
+              "a2a": 16,
+              "quantization_allreduce": 0,
+              "wire_dtype": "bfloat16",
+              "single_stream": true
+            }
+          ],
+          "full_model_loaded": false,
+          "performance_measured": false
+        },
+        {
+          "rank": 1,
+          "results": [
+            {
+              "used_len": 1024,
+              "local_window": [
+                520,
+                1024,
+                504
+              ],
+              "datasets": 2,
+              "bitwise_equal": true,
+              "a2a": 16,
+              "quantization_allreduce": 0,
+              "wire_dtype": "bfloat16",
+              "single_stream": true
+            },
+            {
+              "used_len": 256,
+              "local_window": [
+                520,
+                520,
+                0
+              ],
+              "datasets": 2,
+              "bitwise_equal": true,
+              "a2a": 16,
+              "quantization_allreduce": 0,
+              "wire_dtype": "bfloat16",
+              "single_stream": true
+            }
+          ],
+          "full_model_loaded": false,
+          "performance_measured": false
+        }
+      ],
+      "environment_note": "isolated wheel requires original mindiesd.libs in child LD_LIBRARY_PATH; copied omni version metadata warns about vLLM version mismatch",
+      "full_model_video_performance": "not run"
+    },
     "full_model_video_performance": "not run"
   }
 }
