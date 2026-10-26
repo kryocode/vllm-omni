@@ -96,8 +96,8 @@ from vllm_omni.quantization.component_config import (
     resolve_encoder_quant_config as _resolve_encoder_quant_config,
 )
 
-from .batched_packing import minimax_h3_batched_forward_kwargs
 from .attention.mindiesd_h3 import prepare_h3_request
+from .batched_packing import minimax_h3_batched_forward_kwargs
 from .condition_noise import (
     minimax_h3_audio_cond_noise_aug_rows,
     minimax_h3_imgvid_cond_noise_aug_rows,
@@ -1660,6 +1660,7 @@ class MiniMaxH3Pipeline(
             text_embeddings=text_embeddings,
             token_tags=tags,
             device=self.device,
+            optimization_config=self.transformer.optimization_config,
         )
 
         visual_anchor = visual_condition

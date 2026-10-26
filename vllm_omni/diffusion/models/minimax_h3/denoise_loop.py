@@ -10,7 +10,6 @@ rows stay pinned to their noised step-0 anchors.
 from __future__ import annotations
 
 import functools
-import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
@@ -28,6 +27,7 @@ from vllm_omni.diffusion.forward_context import (
 from vllm_omni.platforms import current_omni_platform
 
 from .latent_mask import MiniMaxH3LatentEdit, minimax_h3_prepare_edit_rows
+from .optimization import H3OptimizationConfig
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
@@ -48,13 +48,12 @@ logger = init_logger(__name__)
 # call -- 50 layers x ~38 sparse steps, repeated on every rank. That reorder is
 # a pure function of the two span grids, so the branch can hold its rows in that
 # order from the start and let the kernel skip the reorder entirely.
-_RF_HOIST_ENV = "VLLM_OMNI_MINIMAX_H3_RF_HOIST_REORDER"
 _RF_BLOCK_SIZE = 128
 
 
 def _rf_hoist_enabled() -> bool:
-    """Whether the packed row reorder is hoisted out of the attention call."""
-    return os.environ.get(_RF_HOIST_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+    """Resolve method 2 through the same layout selector as the transformer."""
+    return H3OptimizationConfig.from_env().rf_layout == "legacy_input_hoist"
 
 
 @functools.cache
@@ -105,7 +104,9 @@ class MiniMaxH3DenoiseBranch:
         text_embeddings: torch.Tensor,
         token_tags: torch.Tensor,
         device: torch.device,
+        optimization_config: H3OptimizationConfig | None = None,
     ) -> None:
+        self.optimization_config = optimization_config
         seq_len = int(packed["seq_len"])
         self.seq_len = seq_len
         self._rf_request_hoist_calls = 0
@@ -229,13 +230,13 @@ class MiniMaxH3DenoiseBranch:
 
         Returns whether the rows were relabelled.
         """
-        if not _rf_hoist_enabled():
+        config = getattr(self, "optimization_config", None)
+        if not (config.rf_layout == "legacy_input_hoist" if config is not None else _rf_hoist_enabled()):
             return False
         if not _mindiesd_accepts_pre_rearranged():
             logger.warning_once(
-                "MiniMax-H3 row-reorder hoist was requested (%s) but the installed MindIE-SD "
+                "MiniMax-H3 pre_embed row-reorder hoist was requested but the installed MindIE-SD "
                 "sparse_attention does not accept pre_rearranged=; keeping the per-layer reorder.",
-                _RF_HOIST_ENV,
             )
             return False
         try:
@@ -250,8 +251,7 @@ class MiniMaxH3DenoiseBranch:
             )
         except Exception as exc:  # noqa: BLE001 - any refusal keeps the per-layer path
             logger.warning_once(
-                "MiniMax-H3 row-reorder hoist is unavailable for this layout (%s); "
-                "keeping the per-layer reorder.",
+                "MiniMax-H3 row-reorder hoist is unavailable for this layout (%s); keeping the per-layer reorder.",
                 exc,
             )
             return False
@@ -286,8 +286,7 @@ class MiniMaxH3DenoiseBranch:
         self.static_kwargs["text_pos_info"] = {"position_ids": self.text_pos_dev}
         self.static_kwargs["img_pos_for_infer_output_info"] = {"position_ids": self.img_pos_dev}
         logger.info_once(
-            "MiniMax-H3 pos rows: block-sparse row reorder hoisted out of the attention call "
-            "(%d real rows, %d spans).",
+            "MiniMax-H3 pos rows: block-sparse row reorder hoisted out of the attention call (%d real rows, %d spans).",
             self.used_len,
             len(spans),
         )
@@ -296,9 +295,12 @@ class MiniMaxH3DenoiseBranch:
     def rf_layout_proof(self) -> dict[str, Any]:
         """Host-only request receipt; kernel evidence remains a separate numeric gate."""
         layout = self.static_kwargs["video_token_layout"]
-        return dict(request_hoist_calls=self._rf_request_hoist_calls,
-                    pre_rearranged=bool(getattr(layout, "pre_rearranged", False)),
-                    used_len=self.used_len, seq_len=self.seq_len)
+        return dict(
+            request_hoist_calls=self._rf_request_hoist_calls,
+            pre_rearranged=bool(getattr(layout, "pre_rearranged", False)),
+            used_len=self.used_len,
+            seq_len=self.seq_len,
+        )
 
     def prepare_rope_table(self, model: Any) -> None:
         """Materialize the branch-local DiT RoPE table once per denoise run.

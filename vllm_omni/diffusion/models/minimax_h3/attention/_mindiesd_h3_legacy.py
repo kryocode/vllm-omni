@@ -58,7 +58,7 @@ def _d_mode() -> bool:
     return value == "1"
 
 
-def _graph_signature(impl, plan, metadata):
+def _graph_signature(impl, plan, metadata, config=None):
     """Describe the unchanged F consumer without modifying RainFusion itself.
 
     Sparse full-query RF reads geometry/policy scalars only. Dense varlen
@@ -73,22 +73,38 @@ def _graph_signature(impl, plan, metadata):
     if not all(hasattr(backend, name) for name in ("_BLOCK_SIZE", "_INNER_PRECISE")):
         return None
     rf = _mindiesd_module("layers.flash_attn.rf_geometry")
-    spans = tuple((int(s["start"]), tuple(int(v) for v in s["latent_shape"]))
-                  for s in plan.video_spans)
-    return ("unchanged_F_rf_v2_full", "sparse", int(plan.used_len), spans,
-            float(impl.rainfusion.sparsity), float(impl.softmax_scale),
-            int(backend._BLOCK_SIZE), int(backend._INNER_PRECISE), "bf16",
-            bool(rf.rf_pool_split_enabled()), os.environ.get("MINDIE_SD_FA_TYPE", ""))
+    spans = tuple((int(s["start"]), tuple(int(v) for v in s["latent_shape"])) for s in plan.video_spans)
+    return (
+        "unchanged_F_rf_v2_full",
+        "sparse",
+        int(plan.used_len),
+        spans,
+        float(impl.rainfusion.sparsity),
+        float(impl.softmax_scale),
+        int(backend._BLOCK_SIZE),
+        int(backend._INNER_PRECISE),
+        "bf16",
+        (False if config is not None and config.isolated else bool(rf.rf_pool_split_enabled())),
+        os.environ.get("MINDIE_SD_FA_TYPE", ""),
+    )
 
 
 class MindIESDH3Parallel:
     """Model-owned state shared by layers and denoise steps, initialized lazily."""
 
-    def __init__(self) -> None:
-        self.enabled = _enabled("MINDIESD", default=False)
-        self.overlap = _enabled("MINDIESD_OVERLAP")
-        self.verify_first = _enabled("MINDIESD_VERIFY_FIRST", default=False)
-        chunk_size = int(os.environ.get("VLLM_OMNI_MINIMAX_H3_MINDIESD_HEAD_CHUNK_SIZE", "1"))
+    def __init__(self, config=None) -> None:
+        self.enabled = config.enabled("MINDIESD") if config is not None else _enabled("MINDIESD", default=False)
+        self.overlap = config.enabled("MINDIESD_OVERLAP") if config is not None else _enabled("MINDIESD_OVERLAP")
+        self.verify_first = (
+            config.enabled("MINDIESD_VERIFY_FIRST")
+            if config is not None
+            else _enabled("MINDIESD_VERIFY_FIRST", default=False)
+        )
+        chunk_size = int(
+            config.value("VLLM_OMNI_MINIMAX_H3_MINDIESD_HEAD_CHUNK_SIZE", "1")
+            if config is not None
+            else os.environ.get("VLLM_OMNI_MINIMAX_H3_MINDIESD_HEAD_CHUNK_SIZE", "1")
+        )
         if chunk_size < 0:
             raise ValueError("MINDIESD_HEAD_CHUNK_SIZE must be nonnegative.")
         self.head_chunk_size = chunk_size or None

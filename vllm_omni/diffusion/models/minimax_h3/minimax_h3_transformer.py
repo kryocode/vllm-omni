@@ -57,9 +57,9 @@ from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelCont
 from vllm_omni.platforms import current_omni_platform
 
 from .attention.mindiesd_h3 import MindIESDH3Parallel
+from .fasth3 import _resolve_native_target
 from .optimization import H3OptimizationConfig
 from .rf_layout import H3RFLayoutAdapter
-from .fasth3 import _resolve_native_target
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -479,7 +479,7 @@ class MiniMaxH3Attention(nn.Module):
             prefix=prefix,
             impl_overrides={"FASTVIDEO_VSA": MiniMaxH3VSAImpl},
         )
-        self._mindiesd_parallel = MindIESDH3Parallel()
+        self._mindiesd_parallel = MindIESDH3Parallel(H3OptimizationConfig.from_settings({}))
 
     def enable_vsa_gate(self) -> None:
         """Build the VSA compression gate this attention would otherwise lack.
@@ -1181,8 +1181,8 @@ class MiniMaxH3DiTModel(nn.Module):
         diffusers_weights: bool | None = None,
     ) -> None:
         super().__init__()
-        self.optimization_config = H3OptimizationConfig.from_env()
-        self.optimization_config.activate()
+        self.optimization_config = H3OptimizationConfig.from_config(od_config)
+        logger.info("MiniMax-H3 command-line optimization config: %s", self.optimization_config.cli_snapshot())
         self._rf_layout = H3RFLayoutAdapter()
         tf_config = od_config.tf_model_config
         config_mapping = tf_config.to_dict() if hasattr(tf_config, "to_dict") else dict(tf_config)
@@ -1276,10 +1276,11 @@ class MiniMaxH3DiTModel(nn.Module):
             prefix="final_layer",
         )
         # One lazy communication state shared across DiT layers and steps.
-        self._mindiesd_parallel = MindIESDH3Parallel()
+        self._mindiesd_parallel = MindIESDH3Parallel(self.optimization_config)
         for module in self.modules():
             if isinstance(module, MiniMaxH3Attention):
                 module._mindiesd_parallel = self._mindiesd_parallel
+                module.attention.attention._h3_optimization_config = self.optimization_config
         self._mark_missing_params_required()
 
     def enable_vsa_gates(self, *, sparsity: float | None = None) -> None:
@@ -1681,7 +1682,10 @@ class MiniMaxH3DiTModel(nn.Module):
                 video_layout, seq_len=seq_len, used_len=max_seqlen, device=device, sp=get_sp_group()
             )
             hidden, block_rope, block_combined = rf_plan.enter(
-                hidden, block_rope, inverse_indices, token_tags,
+                hidden,
+                block_rope,
+                inverse_indices,
+                token_tags,
                 modality_count=MINIMAX_H3_ADALN_MODALITY_NUM,
                 adaln_rows=unique_timesteps.numel() * MINIMAX_H3_ADALN_MODALITY_NUM,
             )

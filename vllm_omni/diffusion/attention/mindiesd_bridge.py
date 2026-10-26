@@ -38,7 +38,8 @@ class RouteContract:
 class AttentionBridge:
     """Persistent transport owner with explicit, rank-agreed request scope."""
 
-    def __init__(self, *, overlap=True, head_chunk_size=1):
+    def __init__(self, *, overlap=True, head_chunk_size=1, execution_options=None):
+        self.execution_options = dict(execution_options or {})
         self.overlap = overlap
         self.head_chunk_size = head_chunk_size
         self.state = None
@@ -63,15 +64,15 @@ class AttentionBridge:
         is fatal before attention; do not continue the denoise loop on one rank.
         """
         if self.failed:
-            raise RuntimeError('Failed attention bridge: terminate participating workers')
+            raise RuntimeError("Failed attention bridge: terminate participating workers")
         if self.prepared:
-            raise RuntimeError('Previous attention request has not been finished')
+            raise RuntimeError("Previous attention request has not been finished")
         world = dist.get_world_size(group)
         context = (id(group), world, dist.get_rank(group), str(device))
         if self._transport_context is not None and context != self._transport_context:
             self.failed = True
-            raise RuntimeError('Attention transport group/device context cannot change')
-        parallel = import_module('mindiesd.parallel')
+            raise RuntimeError("Attention transport group/device context cannot change")
+        parallel = import_module("mindiesd.parallel")
         if self.state is None:
             self.state = parallel.TransportState(group=group, stream=stream)
             if self.overlap:
@@ -79,35 +80,35 @@ class AttentionBridge:
             self._transport_context = context
         elif stream is not None and self.state.stream is not stream:
             self.failed = True
-            raise RuntimeError('Prepared attention must retain one live transport stream')
+            raise RuntimeError("Prepared attention must retain one live transport stream")
         per_rank = contract.shape[2] // world
         chunk = self.head_chunk_size or per_rank
-        key = ('head_pipeline' if chunk == 1 else 'generic', chunk)
+        key = ("head_pipeline" if chunk == 1 else "generic", chunk)
         if chunk > 0:
             if self._executor_key != key:
-                config = parallel.UlyssesConfig(implementation=key[0], head_chunk_size=chunk)
+                config = parallel.UlyssesConfig(implementation=key[0], head_chunk_size=chunk, **self.execution_options)
                 self.executor = parallel.AttentionExecutor(config=config, state=self.state)
                 self._executor_key = key
             execution_policy = self.executor.execution_signature(graph_requested=graph_requested)
         else:
-            execution_policy = ('unsupported_chunk', chunk)
+            execution_policy = ("unsupported_chunk", chunk)
             candidate = False
         policy_error = None
         lookahead = self.state.lookahead
         if lookahead is not None and (type(lookahead) is not int or lookahead < 1):
-            policy_error = 'Attention lookahead must be a positive integer or None'
-        if os.environ.get('MINDIESD_ATTENTION_GRAPH_PREFIX', '0') not in ('0', '1'):
-            policy_error = 'MINDIESD_ATTENTION_GRAPH_PREFIX must be 0 or 1'
+            policy_error = "Attention lookahead must be a positive integer or None"
+        if not self.execution_options and os.environ.get("MINDIESD_ATTENTION_GRAPH_PREFIX", "0") not in ("0", "1"):
+            policy_error = "MINDIESD_ATTENTION_GRAPH_PREFIX must be 0 or 1"
         candidate = bool(candidate and policy_error is None)
         payload = {
-            'plan_id': plan_id,
-            'contract': asdict(contract),
-            'overlap': self.overlap,
-            'head_chunk_size': self.head_chunk_size,
-            'eager': True,
-            'execution_policy': execution_policy,
+            "plan_id": plan_id,
+            "contract": asdict(contract),
+            "overlap": self.overlap,
+            "head_chunk_size": self.head_chunk_size,
+            "eager": True,
+            "execution_policy": execution_policy,
         }
-        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).digest()
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).digest()
         local = torch.tensor([int(candidate), *digest], dtype=torch.int64, device=device)
         gathered = torch.empty(world * local.numel(), dtype=torch.int64, device=device)
         try:
@@ -132,7 +133,7 @@ class AttentionBridge:
         self.agreements += 1
         if any(row != rows[0] for row in rows[1:]) or rows[0][0] not in (0, 1):
             self.failed = True
-            raise RuntimeError('Attention request rank agreement failed: route/config/contract differ')
+            raise RuntimeError("Attention request rank agreement failed: route/config/contract differ")
         self.contract, self.group = contract, group
         self.prepared, self.accepted = True, bool(rows[0][0])
         self._execution_policy = execution_policy
@@ -145,11 +146,11 @@ class AttentionBridge:
     def validate_execution_policy(self):
         """Reject rank-local schedule drift before prefetch or data submission."""
         if self.failed:
-            raise RuntimeError('Failed attention bridge: terminate participating workers')
+            raise RuntimeError("Failed attention bridge: terminate participating workers")
         if self.prepared and self.accepted:
             if self.executor.execution_signature(graph_requested=self._graph_requested) != self._execution_policy:
                 self.failed = True
-                raise RuntimeError('Attention execution policy changed after request agreement')
+                raise RuntimeError("Attention execution policy changed after request agreement")
 
     def run(self, q, k, v, *, backend, contract, on_input_chunk_ready=None, graph_signature=None):
         """Return ``(output, stats)`` or None before an agreed transport route.
@@ -159,25 +160,25 @@ class AttentionBridge:
         exceptions poison this owner and propagate without native retry.
         """
         if self.failed:
-            raise RuntimeError('Failed attention bridge: terminate participating workers')
+            raise RuntimeError("Failed attention bridge: terminate participating workers")
         if not self.prepared or not self.accepted:
             return None
         self.validate_execution_policy()
         if contract != self.contract or tuple(q.shape) != self.contract.shape:
             self.failed = True
-            raise RuntimeError('Attention call differs from its prepared request contract')
+            raise RuntimeError("Attention call differs from its prepared request contract")
         if (
             q.ndim != 4
             or k.shape != q.shape
             or v.shape != q.shape
             or q.dtype != torch.bfloat16
             or str(q.dtype) != contract.dtype
-            or q.device.type != 'npu'
+            or q.device.type != "npu"
             or any(t.dtype != q.dtype or t.device != q.device for t in (k, v))
             or self.contract.shape[2] % dist.get_world_size(self.group)
         ):
             self.failed = True
-            raise RuntimeError('Attention Q/K/V violate the prepared BF16 Ulysses contract')
+            raise RuntimeError("Attention Q/K/V violate the prepared BF16 Ulysses contract")
         try:
             output, stats = self.executor(
                 q,
@@ -191,7 +192,7 @@ class AttentionBridge:
                 graph_signature=graph_signature,
             )
             if output.shape != q.shape or output.dtype != q.dtype or output.device != q.device:
-                raise RuntimeError('MindIE-SD did not restore the local BSND tensor contract')
+                raise RuntimeError("MindIE-SD did not restore the local BSND tensor contract")
         except BaseException:
             self.failed = True
             raise
