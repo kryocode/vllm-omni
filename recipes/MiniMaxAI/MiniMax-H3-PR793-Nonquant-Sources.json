@@ -17,27 +17,25 @@
       "mindiesd/parallel/topology.py": "a44c4acd49be2d71f9f9e93774bbfe33672cbc3be2016727712d719ea4353ff8",
       "mindiesd/parallel/state.py": "c942c0835df675caaf0bc61dc1549f57d27c445e88f69109730955a9eaf9b068",
       "mindiesd/parallel/comm.py": "42ae03577cf313ac690fb801ffa04098af4a7f5b49f7f39b84575b184eba11da",
-      "mindiesd/parallel/pipeline.py": "4cd8a3d145dfd1625bf67086d18197e779e5c84685f750c3d7327cb7c02772e9",
-      "tests/parallel/test_pr793_nonquant.py": "af78b68dc06f01750e32c1cfa2be4a5f4be7b1e49d88e0e5d4e6729b80da6ca0"
+      "mindiesd/parallel/pipeline.py": "1021340c89459ddd9a440357c9fa2ddbca30d3b38a23e112064532c7d8ec25b3",
+      "tests/parallel/test_pr793_nonquant.py": "19aeff7fe6d7bb4994f436adba3a21e9aa5f7ea26a7ad80c8bf9a499f57b3078",
+      "mindiesd/layers/flash_attn/sparse_flash_attn_rf_v2.py": "00b7bd5ff10e477af30b8571eaf56e9b96e4fdc07286ccec9fdbdfb0c5090128"
     },
     "vllm-omni": {
-      "vllm_omni/diffusion/models/minimax_h3/attention/pr793_nonquant.py": "a3c5fd50a218743620c4292251ac1268afe02a4b198bb1c27b7cf9f36241bdd0",
+      "vllm_omni/diffusion/models/minimax_h3/attention/pr793_nonquant.py": "3ed66c801b18e605570c004fcc6f4b48559e881fed15fd0791f681baf08910f2",
       "vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py": "976a74d1e4bef74f86863b9c1b5df1a83fa9cd0950a846d46b6133ec276bc8f8",
-      "tests/attention/test_pr793_nonquant.py": "bad00da24d686af1be30c8b78034e64ae286b3c80d557c7c3a18ff42cb2efa68"
+      "tests/attention/test_pr793_nonquant.py": "81af2063135a472f6284e603ed7042856094f3e9dea4f3c7155d2d4115ab8c76"
     }
   },
   "validation": {
-    "sd_cpu_passed": 11,
-    "omni_cpu_passed": 10,
-    "real_two_rank_gloo": true,
+    "sd_cpu_passed": 13,
+    "omni_cpu_passed": 11,
     "npu_paired_probe": {
       "status": "passed",
-      "date": "2026-10-27",
       "physical_devices": [
-        2,
-        3
+        0,
+        1
       ],
-      "scope": "real HCCL/native BF16 RF; 8 heads, 2 lengths, 3 datasets, serial and dual stream; fixed tiny plans/group carrier",
       "results": [
         {
           "rank": 0,
@@ -135,19 +133,36 @@
           "full_model_loaded": false,
           "performance_measured": false
         }
-      ],
-      "deployed_files": 25,
-      "byte_identical_files": 22,
-      "post_probe_docstrings_only": [
-        "npu_pair_probe.py",
-        "overlay/MindIE-SD/mindiesd/parallel/pipeline.py",
-        "overlay/vllm-omni/vllm_omni/diffusion/models/minimax_h3/attention/pr793_nonquant.py"
-      ],
-      "full_model_video_performance": "not run",
-      "environment_note": "child mindiesd.libs path; copied omni version metadata warns about vLLM mismatch"
+      ]
     },
-    "previous_inherited_stack_results": "superseded",
-    "full_model_video_performance": "not run"
+    "full_model_video_performance": {
+      "status": "complete",
+      "remote_root": "/home/l00816061/python_project/h3_pr793_fix_20261027-dfc75d37",
+      "formal_forward_time_s": [
+        47.522,
+        47.686,
+        47.57
+      ],
+      "mean_forward_time_s": 47.592666666666666,
+      "historical_baseline_mean_s": 52.836666666666666,
+      "comparison_basis": "historical reference only; user cancelled baseline rerun",
+      "all_formal_video_md5": "ac7dbc20d921a7bb4d82e5a802724bff",
+      "profile_check_exit": 0,
+      "a2a_compute_overlap_percent": 89.33,
+      "a2a_rf_overlap_percent": 52.89
+    },
+    "post_validation_format_ast": {
+      "mindiesd/layers/flash_attn/sparse_flash_attn_rf_v2.py": {
+        "tested_sha256_lf": "51c63a7f788fddffa2215d7fadca520e7ac383bc067da70197188bcec7014cbe",
+        "formatted_sha256_lf": "00b7bd5ff10e477af30b8571eaf56e9b96e4fdc07286ccec9fdbdfb0c5090128",
+        "ast_identical": true
+      },
+      "tests/parallel/test_pr793_nonquant.py": {
+        "tested_sha256_lf": "aa81a6fad0d22c7adc0992aeb25b576df423e87b1f486d2eec5d93a8cf436ed1",
+        "formatted_sha256_lf": "19aeff7fe6d7bb4994f436adba3a21e9aa5f7ea26a7ad80c8bf9a499f57b3078",
+        "ast_identical": true
+      }
+    }
   },
   "imported_from_archive": [
     "eager dual-stream full-lookahead schedule only"
@@ -156,5 +171,9 @@
     "omni_pr793_route": false,
     "overlap_within_route": true,
     "sd_state_overlap": true
-  }
+  },
+  "synchronization_fix": [
+    "cache retained device indices in geometry plan",
+    "use existing SP CPU group for rank admission"
+  ]
 }

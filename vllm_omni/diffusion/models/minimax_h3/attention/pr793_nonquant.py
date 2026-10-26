@@ -73,7 +73,9 @@ class MindIESDH3PR793:
                 )
             )
         signatures = [None] * world
-        dist.all_gather_object(signatures, signature, group=group)
+        # SP and Ulysses have the same members under the strict topology above.
+        # Keep collective admission, without NPU/CPU round trips on every layer.
+        dist.all_gather_object(signatures, signature, group=sp.cpu_group)
         if signature is None or any(s != signature for s in signatures):
             raise ValueError("PR793 nonquant rank contracts disagree or request is unsupported")
         if plan is None:

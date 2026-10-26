@@ -23,7 +23,8 @@ def env(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_PR793_NONQUANT", "1")
     calls = []
     group = object()
-    namespace["get_sp_group"] = lambda: types.SimpleNamespace(ulysses_group=group, world_size=2)
+    cpu_group = object()
+    namespace["get_sp_group"] = lambda: types.SimpleNamespace(ulysses_group=group, cpu_group=cpu_group, world_size=2)
     namespace["get_ulysses_mode"] = lambda **kw: "strict"
     fake_dist = types.SimpleNamespace(get_world_size=lambda pg: 2, get_rank=lambda pg: 1)
     fake_dist.all_gather_object = lambda dst, value, **kw: dst.__setitem__(slice(None), [value, value])
@@ -110,6 +111,18 @@ def test_disagreement_refused_before_data(env):
     with pytest.raises(ValueError, match="disagree"):
         env.cls().try_attention(env.attention, env.q, env.q, env.q, env.metadata)
     assert not env.calls
+
+
+def test_rank_contract_uses_existing_cpu_group(env):
+    groups = []
+
+    def gather(dst, value, *, group):
+        groups.append(group)
+        dst[:] = [value, value]
+
+    env.dist.all_gather_object = gather
+    env.cls().try_attention(env.attention, env.q, env.q, env.q, env.metadata)
+    assert groups == [env.namespace["get_sp_group"]().cpu_group]
 
 
 def test_old_optimization_environment_does_not_enable_route(env, monkeypatch):
