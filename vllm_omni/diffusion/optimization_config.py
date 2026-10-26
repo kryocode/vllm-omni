@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Typed startup options for H3 execution; no environment or device state."""
 
 H3_EXECUTION_OPTIONS = {

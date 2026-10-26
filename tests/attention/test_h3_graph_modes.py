@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # ruff: noqa: F811 -- imported pytest fixtures are reused as argument names
 """Graph variant selection and explicit block-end prefetch release contracts."""
 

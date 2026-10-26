@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Host-only tests for RF policy routing; no torch or device import required."""
 
 import importlib.util

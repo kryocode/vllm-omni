@@ -1,0 +1,158 @@
+{
+  "archive_id": "h3-optimization-archive-20261026",
+  "date": "2026-10-26",
+  "branch": "minimax-h3-u8-refactor-20261022",
+  "repository": "vllm-omni",
+  "pair": {
+    "MindIE-SD": "https://gitcode.com/kryocode/MindIE-SD",
+    "vllm-omni": "https://github.com/kryocode/vllm-omni"
+  },
+  "features": [
+    "BF16 head communication/compute pipeline, prepacked sends and output views",
+    "independent RF geometry cache and post_embed/pre_embed layouts",
+    "Graph1 prefix/body and Graph2 whole-region execution",
+    "DLO first-head event gate and Graph2 block-end release",
+    "INT8 QBMM NZ weight format with DLO ownership",
+    "six explicit CLI options with defaults disabling new optimizations"
+  ],
+  "removed_paths": [],
+  "validation": {
+    "cpu": {
+      "passed": 189,
+      "subtests_passed": 97
+    },
+    "scope": "Existing targeted CPU contracts; no NPU work in this archival operation.",
+    "historical_npu": "Prior 2026-10-26 small-tensor probes are historical evidence, not a new end-to-end run.",
+    "ruff_check_and_format": "passed",
+    "offline_precommit": "passed: whitespace, EOF, JSON, merge conflict, private key, Ruff check and format",
+    "full_precommit": "Environment initialization did not complete; remote Node/npm tool setup unavailable.",
+    "full_model_video_and_performance_revalidated": false
+  },
+  "hash_convention": "SHA256 of UTF-8 source bytes after CRLF-to-LF normalization; excludes this manifest.",
+  "sources": {
+    "tests/attention/test_grouped_rf_tensor_path.py": {
+      "sha256_lf": "015cf6d6a41dcb8529cc3c440e55c058b40f7d9dea087bd0eff9dac5695370d2",
+      "bytes_lf": 4503
+    },
+    "tests/attention/test_h3_cli_runtime.py": {
+      "sha256_lf": "892808d4be7af850ea5823c5d4e16767f62126c4943d9665287557ff5ef2eb82",
+      "bytes_lf": 10623
+    },
+    "tests/attention/test_h3_graph_modes.py": {
+      "sha256_lf": "a94d5e532776170072d6cde5fa10d4764719a0f45d31612741a70036a38264bc",
+      "bytes_lf": 8533
+    },
+    "tests/attention/test_h3_optimization.py": {
+      "sha256_lf": "91349dafb03fd80ce87e3adf9bd6823458cffc93109ce92aefd14e0a92a82bb9",
+      "bytes_lf": 9677
+    },
+    "tests/attention/test_h3_pre_embed_layout.py": {
+      "sha256_lf": "ae3273a7a26375caeb60b261ecc4cd30190f573a0157c3abe01e79ff124ad6eb",
+      "bytes_lf": 8352
+    },
+    "tests/attention/test_mindiesd_bridge.py": {
+      "sha256_lf": "6950aa7cf6a13154ef530c8e6db3453618f89f38e40b96c19f2886973264b668",
+      "bytes_lf": 35749
+    },
+    "tests/attention/test_mindiesd_group_runtime.py": {
+      "sha256_lf": "f76e5fbc38baac9838b0acfcc78bade9c265dab9e6cb8d3763b5072a3fab19c4",
+      "bytes_lf": 3760
+    },
+    "tests/attention/test_prefetch_ticket.py": {
+      "sha256_lf": "37139d53bb000b75222dd382a47be9d43225cb1ffb00337f36a3695e940d4841",
+      "bytes_lf": 19199
+    },
+    "tests/diffusion/models/minimax_h3/test_h3_cli_config.py": {
+      "sha256_lf": "45fea7882da88eae3bb5ddcdfac4412272eb3277e83183683f2d903b84e433c3",
+      "bytes_lf": 6239
+    },
+    "tests/diffusion/models/minimax_h3/test_h3_optimization_groups.py": {
+      "sha256_lf": "3076dbfebe8eaf773c7316dc566a5a8e5d4c00bb0721ac730a78999e7f4d09cd",
+      "bytes_lf": 12325
+    },
+    "vllm_omni/config/omni_config.py": {
+      "sha256_lf": "6099398db52f9e2a509be2caa309240506c690d3731b25b11e4f2ee5bb3ac236",
+      "bytes_lf": 96930
+    },
+    "vllm_omni/config/stage_config.py": {
+      "sha256_lf": "7a9e9e6bb31294a7cf07ef04f40cbd4195e816e042fd3ccd3f009db4b4e44125",
+      "bytes_lf": 57728
+    },
+    "vllm_omni/diffusion/attention/backends/mindiesd_native.py": {
+      "sha256_lf": "7869f959c71fc254429c6b541ab61a11bbd7d5fb011fb3c78bceb69115f5abc2",
+      "bytes_lf": 8237
+    },
+    "vllm_omni/diffusion/attention/backends/rainfusion_attn.py": {
+      "sha256_lf": "af3ed306fc075148168d50328ed63cc074fc27f533d623062bb4730e175a27d5",
+      "bytes_lf": 25961
+    },
+    "vllm_omni/diffusion/attention/mindiesd_bridge.py": {
+      "sha256_lf": "896d612ceaf41c308dc1104c3f7b8503f8595294f00c5f27af610446f02a35d2",
+      "bytes_lf": 9417
+    },
+    "vllm_omni/diffusion/data.py": {
+      "sha256_lf": "7c53c033781a362226158f988657d6b77592be7fc3fae1dd8510eef5dd4004d5",
+      "bytes_lf": 102317
+    },
+    "vllm_omni/diffusion/models/minimax_h3/attention/_mindiesd_h3_legacy.py": {
+      "sha256_lf": "a0482742e065054c57f991d49d6b600ca791e3001a9227d232fb5c2c3984f110",
+      "bytes_lf": 11823
+    },
+    "vllm_omni/diffusion/models/minimax_h3/attention/mindiesd_h3.py": {
+      "sha256_lf": "622ce20f713221c9e92513061516eb6f2470210550d84daa6bd9c690528cbfc1",
+      "bytes_lf": 35093
+    },
+    "vllm_omni/diffusion/models/minimax_h3/denoise_loop.py": {
+      "sha256_lf": "8b0e967262b4854236630ce079ee4da8351af1ba2d3110a410d1e76f94d2445e",
+      "bytes_lf": 28568
+    },
+    "vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py": {
+      "sha256_lf": "250c1f98cf58f73d4b7afe5cd15f0d42f65f35bc36334cb89fc36427084371e7",
+      "bytes_lf": 70555
+    },
+    "vllm_omni/diffusion/models/minimax_h3/optimization.py": {
+      "sha256_lf": "3e9e8dfabb38744f509e9f3992adbb59015fae5ff907123856c613e6e4ee7865",
+      "bytes_lf": 20683
+    },
+    "vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3.py": {
+      "sha256_lf": "5d240c94565924ef719dd3beae1f4275da55894b981b9162a92a46b9b144d076",
+      "bytes_lf": 132378
+    },
+    "vllm_omni/diffusion/models/minimax_h3/rf_layout.py": {
+      "sha256_lf": "ba577c18ea54fef8cb03fb106c1a4614e837c100cecc777f51e89564a0afd9d3",
+      "bytes_lf": 6658
+    },
+    "vllm_omni/diffusion/offloader/base.py": {
+      "sha256_lf": "e1a5b8b0387b5eaf4353ad85a3bb0df0fcc6e42c2be69a081f6c267c6c4ac8f4",
+      "bytes_lf": 10540
+    },
+    "vllm_omni/diffusion/offloader/distributed_layerwise_backend.py": {
+      "sha256_lf": "5ce95dfb30e54077e22ddf8ac77d1c10616685d1099167aec5268adeeff659fe",
+      "bytes_lf": 108167
+    },
+    "vllm_omni/diffusion/offloader/execution_stats.py": {
+      "sha256_lf": "d3429aa1333d83907ab52b758cb4c173dfcaed61c4509c4478aa80996b2b3ef2",
+      "bytes_lf": 2066
+    },
+    "vllm_omni/diffusion/offloader/prefetch_ticket.py": {
+      "sha256_lf": "edb5b33e0cb6fc72b0693dfb18f2cc02ab9907eb4b98e3e3d1d43945c15eb343",
+      "bytes_lf": 5965
+    },
+    "vllm_omni/diffusion/offloader/qbmm_nz.py": {
+      "sha256_lf": "f522a159f47548baed9941b7b99e6190257fe2868c037aec0f77f2c6535c5599",
+      "bytes_lf": 12756
+    },
+    "vllm_omni/diffusion/optimization_config.py": {
+      "sha256_lf": "2187f4c930da277dd48a3356088a62c0f7e3938a15ff8cfb6d3a678987e9ff3e",
+      "bytes_lf": 2410
+    },
+    "vllm_omni/engine/arg_utils.py": {
+      "sha256_lf": "affe140e15706ade025a1b0cbaa338eb4f0b86208a2c13afa429bec504153a90",
+      "bytes_lf": 31455
+    },
+    "vllm_omni/entrypoints/cli/serve.py": {
+      "sha256_lf": "9956c227bfc86732009b50d52b2427c4a61d09e6eae29ce1e08381df436ecf83",
+      "bytes_lf": 64901
+    }
+  }
+}

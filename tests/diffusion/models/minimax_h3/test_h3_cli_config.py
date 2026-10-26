@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Public optimization configuration contracts, independent of accelerator imports."""
 
 import importlib.util
