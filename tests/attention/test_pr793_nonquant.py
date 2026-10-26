@@ -123,3 +123,19 @@ def test_bad_enable_value(env, monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_PR793_NONQUANT", "yes")
     with pytest.raises(ValueError, match="0 or 1"):
         env.cls()
+
+
+def test_overlap_default_and_opt_out(env, monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINIMAX_H3_PR793_OVERLAP", raising=False)
+    assert env.cls().overlap is True
+    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_PR793_OVERLAP", "0")
+    owner = env.cls()
+    assert owner.overlap is False
+    owner.try_attention(env.attention, env.q, env.q, env.q, env.metadata)
+    assert env.calls
+
+
+def test_bad_overlap_value(env, monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_PR793_OVERLAP", "yes")
+    with pytest.raises(ValueError, match="OVERLAP must be 0 or 1"):
+        env.cls()

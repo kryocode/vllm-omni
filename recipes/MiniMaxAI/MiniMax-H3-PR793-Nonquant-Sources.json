@@ -3,66 +3,87 @@
   "source_pr_head": "d405d3646e40d19873e77a921b818d1fa985e60a",
   "branch": "minimax-h3-pr793",
   "custom_archive_preserved": true,
-  "custom_optimizations_in_current_tree": false,
   "clean_bases": {
     "MindIE-SD": "39950728895b3f00a8cbe641a5329705e73dfaac",
     "vllm-omni": "7149a6d4551caaba138b63f413e3d197d01bd16a"
   },
   "wire_dtype": "bfloat16",
-  "schedule": "current-stream serial per head",
+  "schedule": "optional dual stream, full lookahead default; serial opt-out",
   "quantized_transport_imported": false,
   "quantized_attention_imported": false,
   "sha256_lf_sources": {
     "MindIE-SD": {
       "mindiesd/parallel/__init__.py": "148f9865fdce482ae324b2761aa3b1852d11926bcbbe365b3dc2dd4e5a9eeea1",
       "mindiesd/parallel/topology.py": "a44c4acd49be2d71f9f9e93774bbfe33672cbc3be2016727712d719ea4353ff8",
-      "mindiesd/parallel/state.py": "a9b090743abc507e8d0ee80c73f81c36cf8c86a002b2fcc5441044b0ebfff241",
-      "mindiesd/parallel/comm.py": "6895fddfa14f0820d96d6fb0cdd88a3a4b0e04f5eb5223b61b97df8331683dd4",
-      "mindiesd/parallel/pipeline.py": "27952cef2caec224ac44e30e27a21abb4da2fb724494dff09ccee6468ac12ef6",
-      "tests/parallel/test_pr793_nonquant.py": "44b06827ecc3d0a0834b09b8e10096467d73e4c799e91c9615e2b603329ba8da"
+      "mindiesd/parallel/state.py": "c942c0835df675caaf0bc61dc1549f57d27c445e88f69109730955a9eaf9b068",
+      "mindiesd/parallel/comm.py": "42ae03577cf313ac690fb801ffa04098af4a7f5b49f7f39b84575b184eba11da",
+      "mindiesd/parallel/pipeline.py": "4cd8a3d145dfd1625bf67086d18197e779e5c84685f750c3d7327cb7c02772e9",
+      "tests/parallel/test_pr793_nonquant.py": "af78b68dc06f01750e32c1cfa2be4a5f4be7b1e49d88e0e5d4e6729b80da6ca0"
     },
     "vllm-omni": {
-      "vllm_omni/diffusion/models/minimax_h3/attention/pr793_nonquant.py": "65f7374ddffcb419ca9c155681302944d661b29937b90a8753b5ae758d43a38b",
+      "vllm_omni/diffusion/models/minimax_h3/attention/pr793_nonquant.py": "a3c5fd50a218743620c4292251ac1268afe02a4b198bb1c27b7cf9f36241bdd0",
       "vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py": "976a74d1e4bef74f86863b9c1b5df1a83fa9cd0950a846d46b6133ec276bc8f8",
-      "tests/attention/test_pr793_nonquant.py": "5b5fbaecbb1f208012023a7644ac21b622b353e1fef13f0eacd577aa64ce1362"
+      "tests/attention/test_pr793_nonquant.py": "bad00da24d686af1be30c8b78034e64ae286b3c80d557c7c3a18ff42cb2efa68"
     }
   },
   "validation": {
-    "sd_cpu_passed": 9,
-    "omni_cpu_passed": 8,
+    "sd_cpu_passed": 11,
+    "omni_cpu_passed": 10,
     "real_two_rank_gloo": true,
     "npu_paired_probe": {
       "status": "passed",
-      "date": "2026-10-26",
+      "date": "2026-10-27",
       "physical_devices": [
         2,
         3
       ],
-      "deployed_files_sha256_verified": 25,
+      "scope": "real HCCL/native BF16 RF; 8 heads, 2 lengths, 3 datasets, serial and dual stream; fixed tiny plans/group carrier",
       "results": [
         {
           "rank": 0,
           "results": [
             {
               "used_len": 1024,
-              "datasets": 2,
+              "datasets": 3,
+              "heads": 8,
               "bitwise_equal": true,
-              "a2a": 16,
+              "a2a": 48,
               "quantization_allreduce": 0,
               "wire_dtype": "bfloat16",
-              "single_stream": true
+              "overlap": false
+            },
+            {
+              "used_len": 1024,
+              "datasets": 3,
+              "heads": 8,
+              "bitwise_equal": true,
+              "a2a": 48,
+              "quantization_allreduce": 0,
+              "wire_dtype": "bfloat16",
+              "overlap": true
             },
             {
               "used_len": 256,
-              "datasets": 2,
+              "datasets": 3,
+              "heads": 8,
               "bitwise_equal": true,
-              "a2a": 16,
+              "a2a": 48,
               "quantization_allreduce": 0,
               "wire_dtype": "bfloat16",
-              "single_stream": true
+              "overlap": false
+            },
+            {
+              "used_len": 256,
+              "datasets": 3,
+              "heads": 8,
+              "bitwise_equal": true,
+              "a2a": 48,
+              "quantization_allreduce": 0,
+              "wire_dtype": "bfloat16",
+              "overlap": true
             }
           ],
-          "geometry_plans": 2,
+          "persistent_stream": true,
           "full_model_loaded": false,
           "performance_measured": false
         },
@@ -71,33 +92,69 @@
           "results": [
             {
               "used_len": 1024,
-              "datasets": 2,
+              "datasets": 3,
+              "heads": 8,
               "bitwise_equal": true,
-              "a2a": 16,
+              "a2a": 48,
               "quantization_allreduce": 0,
               "wire_dtype": "bfloat16",
-              "single_stream": true
+              "overlap": false
+            },
+            {
+              "used_len": 1024,
+              "datasets": 3,
+              "heads": 8,
+              "bitwise_equal": true,
+              "a2a": 48,
+              "quantization_allreduce": 0,
+              "wire_dtype": "bfloat16",
+              "overlap": true
             },
             {
               "used_len": 256,
-              "datasets": 2,
+              "datasets": 3,
+              "heads": 8,
               "bitwise_equal": true,
-              "a2a": 16,
+              "a2a": 48,
               "quantization_allreduce": 0,
               "wire_dtype": "bfloat16",
-              "single_stream": true
+              "overlap": false
+            },
+            {
+              "used_len": 256,
+              "datasets": 3,
+              "heads": 8,
+              "bitwise_equal": true,
+              "a2a": 48,
+              "quantization_allreduce": 0,
+              "wire_dtype": "bfloat16",
+              "overlap": true
             }
           ],
-          "geometry_plans": 2,
+          "persistent_stream": true,
           "full_model_loaded": false,
           "performance_measured": false
         }
       ],
-      "scope": "real HCCL, native BF16 RF, thin adapter, fixed tiny RF plans and group carrier",
-      "environment_note": "isolated child LD_LIBRARY_PATH includes original mindiesd.libs; copied omni metadata reports vLLM version mismatch",
-      "full_model_video_performance": "not run"
+      "deployed_files": 25,
+      "byte_identical_files": 22,
+      "post_probe_docstrings_only": [
+        "npu_pair_probe.py",
+        "overlay/MindIE-SD/mindiesd/parallel/pipeline.py",
+        "overlay/vllm-omni/vllm_omni/diffusion/models/minimax_h3/attention/pr793_nonquant.py"
+      ],
+      "full_model_video_performance": "not run",
+      "environment_note": "child mindiesd.libs path; copied omni version metadata warns about vLLM mismatch"
     },
     "previous_inherited_stack_results": "superseded",
     "full_model_video_performance": "not run"
+  },
+  "imported_from_archive": [
+    "eager dual-stream full-lookahead schedule only"
+  ],
+  "defaults": {
+    "omni_pr793_route": false,
+    "overlap_within_route": true,
+    "sd_state_overlap": true
   }
 }

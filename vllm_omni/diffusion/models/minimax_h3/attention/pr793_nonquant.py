@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Thin H3 adapter for PR793's BF16, current-stream sparse path."""
+"""Thin H3 adapter for PR793 BF16 attention and optional archived dual-stream scheduling."""
 
 import os
 
@@ -12,13 +12,17 @@ from vllm_omni.diffusion.forward_context import get_ulysses_mode
 
 
 class MindIESDH3PR793:
-    """One model-owned state shared by DiT layers; no overlap/Graph/DLO policies."""
+    """One model-owned state shared by DiT layers; one overlap switch, no Graph/DLO integration."""
 
     def __init__(self):
         value = os.environ.get("VLLM_OMNI_MINIMAX_H3_PR793_NONQUANT", "0")
         if value not in ("0", "1"):
             raise ValueError("VLLM_OMNI_MINIMAX_H3_PR793_NONQUANT must be 0 or 1")
         self.enabled = value == "1"
+        value = os.environ.get("VLLM_OMNI_MINIMAX_H3_PR793_OVERLAP", "1")
+        if value not in ("0", "1"):
+            raise ValueError("VLLM_OMNI_MINIMAX_H3_PR793_OVERLAP must be 0 or 1")
+        self.overlap = value == "1"
         self.state = None
 
     def try_attention(self, attention, q, k, v, metadata, *, num_requests=1):
@@ -55,10 +59,11 @@ class MindIESDH3PR793:
         signature = None
         if eligible:
             signature = (
-                ("dense",)
+                ("dense", self.overlap)
                 if plan is None
                 else (
                     "sparse",
+                    self.overlap,
                     tuple(q.shape),
                     str(q.dtype),
                     plan.used_len,
@@ -74,7 +79,7 @@ class MindIESDH3PR793:
         if plan is None:
             return None
         if self.state is None:
-            self.state = ParallelState(group=group)
+            self.state = ParallelState(group=group, overlap=self.overlap)
         out = distributed_sparse_attention(
             q,
             k,
