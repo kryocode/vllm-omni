@@ -74,14 +74,6 @@ def _mindiesd_supports_precision() -> bool:
         return False
 
 
-@functools.cache
-def _mindiesd_supports_pre_rearranged() -> bool:
-    """Refuse unknown consumers: ignored kwargs would reorder rows a second time."""
-    from mindiesd import sparse_attention
-
-    return "pre_rearranged" in inspect.signature(sparse_attention).parameters
-
-
 def _try_extract_layer_index(prefix: str) -> int | None:
     if not prefix:
         return None
@@ -138,7 +130,6 @@ class RainFusionPlan:
     prefix_len: int | None = None
     latent_shape: list[int] | None = None
     video_spans: list[dict[str, object]] | None = None
-    pre_rearranged: bool = False
 
 
 class RainFusionAttentionBackend(AttentionBackend):
@@ -481,11 +472,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             dense_context_seqlen,
             int(used_len),
         )
-        return RainFusionPlan(
-            used_len=int(used_len),
-            video_spans=spans,
-            pre_rearranged=bool(getattr(layout, "pre_rearranged", False)),
-        )
+        return RainFusionPlan(used_len=int(used_len), video_spans=spans)
 
     def _forward_sparse_npu(
         self,
@@ -544,41 +531,13 @@ class RainFusionAttentionImpl(AttentionImpl):
             "sparsity": self.rainfusion.sparsity,
             "precision": precision,
         }
-        geometry_cache = extra.get("mindiesd_rf_geometry_cache")
-        output = extra.get("mindiesd_rf_output")
-        # The grouped RF policy also applies to the original framework route,
-        # which does not pass through NativeBackendFactory.
-        from .mindiesd_native import rf_cache_policy
-
-        optimization_config = getattr(self, "_h3_optimization_config", None)
-        cache_policy = rf_cache_policy(optimization_config)
-        if optimization_config is not None and optimization_config.isolated:
-            common_kwargs["pooling_policy"] = "legacy"
-        if cache_policy is False:
-            geometry_cache = None
-        elif cache_policy is True and plan.video_spans is not None and geometry_cache is None:
-            if getattr(self, "_group_geometry_cache", None) is None:
-                from mindiesd.layers.flash_attn.rf_geometry import RFGeometryCache
-
-                self._group_geometry_cache = RFGeometryCache()
-            geometry_cache = self._group_geometry_cache
-        if geometry_cache is not None or output is not None:
-            if precision != "bf16" or plan.video_spans is None or (output is not None and used != query.shape[1]):
-                raise ValueError("Prepared BF16 RainFusion requires an unpadded full multi-span sequence.")
-            if geometry_cache is not None:
-                common_kwargs["geometry_cache"] = geometry_cache
-            if output is not None:
-                common_kwargs["out"] = output
         if plan.video_spans is not None:
-            if plan.pre_rearranged and not _mindiesd_supports_pre_rearranged():
-                raise ValueError("Hoisted RF rows require explicit MindIE-SD pre_rearranged support.")
             out = sparse_attention(
                 q,
                 k,
                 v,
                 sparse_type="rf_v2",
                 video_spans=plan.video_spans,
-                pre_rearranged=plan.pre_rearranged,
                 **common_kwargs,
             )
         else:

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -56,10 +55,7 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.platforms import current_omni_platform
 
-from .attention.mindiesd_h3 import MindIESDH3Parallel
 from .fasth3 import _resolve_native_target
-from .optimization import H3OptimizationConfig
-from .rf_layout import H3RFLayoutAdapter
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -479,7 +475,6 @@ class MiniMaxH3Attention(nn.Module):
             prefix=prefix,
             impl_overrides={"FASTVIDEO_VSA": MiniMaxH3VSAImpl},
         )
-        self._mindiesd_parallel = MindIESDH3Parallel(H3OptimizationConfig.from_settings({}))
 
     def enable_vsa_gate(self) -> None:
         """Build the VSA compression gate this attention would otherwise lack.
@@ -528,7 +523,6 @@ class MiniMaxH3Attention(nn.Module):
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         gate_compress: torch.Tensor | None = None,
-        attention_prefetch_ticket=None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -602,7 +596,6 @@ class MiniMaxH3Attention(nn.Module):
                 "max_seqlen_q": max_seqlen,
                 "max_seqlen_k": max_seqlen,
                 "valid_kv_length": used,
-                "h3_num_requests": num_requests,
                 # Opt the NPU flash backend into the packed varlen path so the
                 # quadratic full_qk mask is never materialized. Ring attention
                 # is excluded: it keeps the aligned padding rows for its
@@ -626,18 +619,24 @@ class MiniMaxH3Attention(nn.Module):
             },
             video_layout=video_layout,
         )
-        q_bsnd, k_bsnd, v_bsnd = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
-        out = self._mindiesd_parallel.try_attention(
-            self.attention,
-            q_bsnd,
-            k_bsnd,
-            v_bsnd,
+        owner = getattr(self, "_pr793_owner", None)
+        if owner is not None:
+            out = owner.try_attention(
+                self.attention,
+                q.unsqueeze(0),
+                k.unsqueeze(0),
+                v.unsqueeze(0),
+                metadata,
+                num_requests=num_requests,
+            )
+            if out is not None:
+                return out.squeeze(0)
+        return self.attention(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
             metadata,
-            prefetch_ticket=attention_prefetch_ticket,
-        )
-        if out is None:
-            out = self.attention(q_bsnd, k_bsnd, v_bsnd, metadata)
-        return out.squeeze(0)
+        ).squeeze(0)
 
     def forward(
         self,
@@ -651,7 +650,6 @@ class MiniMaxH3Attention(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
-        attention_prefetch_ticket=None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -711,7 +709,6 @@ class MiniMaxH3Attention(nn.Module):
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
             gate_compress=gate_compress,
-            attention_prefetch_ticket=attention_prefetch_ticket,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -886,16 +883,6 @@ class MiniMaxH3TokenRefiner(nn.Module):
 
 
 class MiniMaxH3DiTBlock(nn.Module):
-    def qbmm_nz_request_owner(self):
-        """DLO may use NZ only with this owner's shared request agreement."""
-        return self.attn._mindiesd_parallel
-
-    def attention_prefetch_policy(self):
-        return self.attn._mindiesd_parallel.prefetch_policy(self.attn.attention)
-
-    def register_attention_prefetch_ticket(self, ticket):
-        self.attn._mindiesd_parallel.register_prefetch_ticket(ticket)
-
     def __init__(
         self,
         arch: MiniMaxH3DiTArchConfig,
@@ -941,8 +928,6 @@ class MiniMaxH3DiTBlock(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
-        attention_prefetch_ticket=None,
-        rf_block_layout=None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -951,53 +936,48 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm1 -> scale/shift -> attention -> gated residual, followed by
         norm2 -> scale/shift -> MLP -> gated residual.
         """
-        with attention_prefetch_ticket.scope() if attention_prefetch_ticket is not None else nullcontext():
-            parameters = self.adaln_proj(t_emb)
-            if rf_block_layout is not None:
-                parameters = rf_block_layout.adaln_parameters(parameters)
-            (
-                shift_msa,
-                scale_msa,
-                gate_msa,
-                shift_mlp,
-                scale_mlp,
-                gate_mlp,
-            ) = parameters
+        (
+            shift_msa,
+            scale_msa,
+            gate_msa,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+        ) = self.adaln_proj(t_emb)
 
-            residual = x
-            h = rms_norm_indexed_scale_shift(
-                x,
-                self.norm1.weight,
-                shift_msa,
-                scale_msa,
-                combined_indices,
-                self.norm1.variance_epsilon,
-            )
-            h = self.attn(
-                h,
-                rope_table=rope_table,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                packed_total=packed_total,
-                num_requests=num_requests,
-                sp_seq_lens=sp_seq_lens,
-                video_layout=video_layout,
-                vsa_prefix_segments=vsa_prefix_segments,
-                attention_prefetch_ticket=attention_prefetch_ticket,
-            )
-            x, h = indexed_gate_rms_norm_scale_shift(
-                residual,
-                gate_msa,
-                h,
-                self.norm2.weight,
-                shift_mlp,
-                scale_mlp,
-                combined_indices,
-                self.norm2.variance_epsilon,
-            )
-            residual = x
-            h = self.mlp(h)
-            return indexed_gate(residual, gate_mlp, h, combined_indices)
+        residual = x
+        h = rms_norm_indexed_scale_shift(
+            x,
+            self.norm1.weight,
+            shift_msa,
+            scale_msa,
+            combined_indices,
+            self.norm1.variance_epsilon,
+        )
+        h = self.attn(
+            h,
+            rope_table=rope_table,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            packed_total=packed_total,
+            num_requests=num_requests,
+            sp_seq_lens=sp_seq_lens,
+            video_layout=video_layout,
+            vsa_prefix_segments=vsa_prefix_segments,
+        )
+        x, h = indexed_gate_rms_norm_scale_shift(
+            residual,
+            gate_msa,
+            h,
+            self.norm2.weight,
+            shift_mlp,
+            scale_mlp,
+            combined_indices,
+            self.norm2.variance_epsilon,
+        )
+        residual = x
+        h = self.mlp(h)
+        return indexed_gate(residual, gate_mlp, h, combined_indices)
 
 
 class MiniMaxH3FinalLayer(nn.Module):
@@ -1181,9 +1161,6 @@ class MiniMaxH3DiTModel(nn.Module):
         diffusers_weights: bool | None = None,
     ) -> None:
         super().__init__()
-        self.optimization_config = H3OptimizationConfig.from_config(od_config)
-        logger.info("MiniMax-H3 command-line optimization config: %s", self.optimization_config.cli_snapshot())
-        self._rf_layout = H3RFLayoutAdapter()
         tf_config = od_config.tf_model_config
         config_mapping = tf_config.to_dict() if hasattr(tf_config, "to_dict") else dict(tf_config)
         # The native MiniMax-H3 Hub snapshot advertises the Diffusers
@@ -1266,6 +1243,11 @@ class MiniMaxH3DiTModel(nn.Module):
                 for i in range(arch.num_layers)
             ]
         )
+        from .attention.pr793_nonquant import MindIESDH3PR793
+
+        self._pr793_owner = MindIESDH3PR793()
+        for block in self.blocks:
+            block.attn._pr793_owner = self._pr793_owner
         self.sp_prepare = MiniMaxH3SPPrepare()
         self.local_sp_prepare = MiniMaxH3SPPrepare()
         self.sp_gather = MiniMaxH3SPGather()
@@ -1275,12 +1257,6 @@ class MiniMaxH3DiTModel(nn.Module):
             quant_config,
             prefix="final_layer",
         )
-        # One lazy communication state shared across DiT layers and steps.
-        self._mindiesd_parallel = MindIESDH3Parallel(self.optimization_config)
-        for module in self.modules():
-            if isinstance(module, MiniMaxH3Attention):
-                module._mindiesd_parallel = self._mindiesd_parallel
-                module.attention.attention._h3_optimization_config = self.optimization_config
         self._mark_missing_params_required()
 
     def enable_vsa_gates(self, *, sparsity: float | None = None) -> None:
@@ -1552,11 +1528,6 @@ class MiniMaxH3DiTModel(nn.Module):
         return embeddings, t_emb
 
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        config = getattr(self, "optimization_config", None)
-        with self._rf_layout.forward_scope(enabled=config is not None and config.rf_layout == "post_embed"):
-            return self._forward_impl(**kwargs)
-
-    def _forward_impl(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         """Packed inference forward.
 
         Keyword names follow the checkpoint's serving contract.
@@ -1606,8 +1577,6 @@ class MiniMaxH3DiTModel(nn.Module):
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
         video_layout = kwargs.get("video_token_layout")
-        rf_enabled = self.optimization_config.rf_layout == "post_embed"
-        block_video_layout = self._rf_layout.block_metadata(video_layout, enabled=rf_enabled)
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -1674,21 +1643,6 @@ class MiniMaxH3DiTModel(nn.Module):
                 block_rope,
                 block_combined,
             )
-        rf_plan = None
-        if rf_enabled and video_layout is not None and video_layout.video_spans:
-            from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
-
-            rf_plan = self._rf_layout.prepare(
-                video_layout, seq_len=seq_len, used_len=max_seqlen, device=device, sp=get_sp_group()
-            )
-            hidden, block_rope, block_combined = rf_plan.enter(
-                hidden,
-                block_rope,
-                inverse_indices,
-                token_tags,
-                modality_count=MINIMAX_H3_ADALN_MODALITY_NUM,
-                adaln_rows=unique_timesteps.numel() * MINIMAX_H3_ADALN_MODALITY_NUM,
-            )
         for block in self.blocks:
             hidden = block(
                 hidden,
@@ -1699,12 +1653,9 @@ class MiniMaxH3DiTModel(nn.Module):
                 max_seqlen=max_seqlen,
                 packed_total=seq_len,
                 num_requests=num_requests,
-                video_layout=block_video_layout,
+                video_layout=video_layout,
                 vsa_prefix_segments=vsa_prefix_segments,
-                rf_block_layout=rf_plan,
             )
-        if rf_plan is not None:
-            hidden = rf_plan.restore(hidden)
         if local_len == seq_len:
             hidden = self.sp_gather(hidden)
             video_logits, audio_logits = self.final_layer(

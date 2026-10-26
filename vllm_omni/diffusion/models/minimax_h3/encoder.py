@@ -119,7 +119,7 @@ class MiniMaxH3Qwen3VLVocabParallelEmbedding(nn.Module):
         end_idx = start_idx + self.num_embeddings_per_partition
         input_mask = (input_ < start_idx) | (input_ >= end_idx)
         masked_input = input_.clone() - start_idx
-        masked_input.masked_fill_(input_mask, 0)
+        masked_input[input_mask] = 0
         output = F.embedding(masked_input, self.weight)
         output[input_mask, :] = 0.0
         self.group.all_reduce(output)
@@ -1071,9 +1071,7 @@ def _get_rope_index(
                 current_pos += max(grid_thw[1], grid_thw[2]) // spatial_merge_size
         llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
         if attention_mask is not None:
-            position_ids[:, batch_idx].index_copy_(
-                1, attention_mask[batch_idx].bool().nonzero(as_tuple=True)[0], llm_positions.to(position_ids.device)
-            )
+            position_ids[:, batch_idx, attention_mask[batch_idx].bool()] = llm_positions.to(position_ids.device)
         else:
             position_ids[:, batch_idx] = llm_positions.to(position_ids.device)
         mrope_position_deltas.append(llm_positions.max() + 1 - len(current_input_ids))

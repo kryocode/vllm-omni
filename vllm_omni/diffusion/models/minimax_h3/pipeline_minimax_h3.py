@@ -96,7 +96,6 @@ from vllm_omni.quantization.component_config import (
     resolve_encoder_quant_config as _resolve_encoder_quant_config,
 )
 
-from .attention.mindiesd_h3 import prepare_h3_request
 from .batched_packing import minimax_h3_batched_forward_kwargs
 from .condition_noise import (
     minimax_h3_audio_cond_noise_aug_rows,
@@ -1660,7 +1659,6 @@ class MiniMaxH3Pipeline(
             text_embeddings=text_embeddings,
             token_tags=tags,
             device=self.device,
-            optimization_config=self.transformer.optimization_config,
         )
 
         visual_anchor = visual_condition
@@ -1878,10 +1876,7 @@ class MiniMaxH3Pipeline(
         )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
-        with (
-            prepare_h3_request(transformer, branch),
-            self._resident_dit_layers_on_device(enabled=transformer is self.transformer),
-        ):
+        with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
             with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     model=transformer,

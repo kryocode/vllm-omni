@@ -44,7 +44,6 @@ from vllm_omni.diffusion.forward_context import build_local_sp_padding_mask, get
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
-from vllm_omni.diffusion.models.wan2_2.mindiesd_wan import MindIESDWanParallel
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.mxfp4_config import NPUMxfp4LinearMethod
 
@@ -409,7 +408,6 @@ class WanSelfAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         self.rotary_embedding = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
-        self._mindiesd_wan = None
 
         # Unified attention layer
         self.attn = Attention(
@@ -479,11 +477,7 @@ class WanSelfAttention(nn.Module):
             key = self.rotary_embedding(key, freqs_cos, freqs_sin)
 
         # Compute attention using unified attention layer
-        bridge_output = (
-            self._mindiesd_wan.try_attention(self.attn, query, key, value, attn_metadata)
-            if self._mindiesd_wan is not None else None
-        )
-        hidden_states = self.attn(query, key, value, attn_metadata) if bridge_output is None else bridge_output
+        hidden_states = self.attn(query, key, value, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
@@ -1002,9 +996,6 @@ class WanTransformer3DModel(nn.Module):
         self._cached_rope_emb = None
         self._cached_rope_resolution = None
         self._validate_w4a8_fallback_layers(quant_config)
-        self._mindiesd_wan = MindIESDWanParallel()
-        for block in self.blocks[self.start_layer : self.end_layer]:
-            block.attn1._mindiesd_wan = self._mindiesd_wan
 
     def _validate_w4a8_fallback_layers(self, quant_config: QuantizationConfig | None) -> None:
         """Reject checkpoint aliases/typos before loading weights or running inference."""
