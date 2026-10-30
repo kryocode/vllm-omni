@@ -79,6 +79,29 @@ For common configuration and selector behavior, see the
 [attention backend overview](../attention_backends.md) and the
 [backend selection design](../../../design/feature/attention_backend_selection.md).
 
+## MiniMax-H3 distributed sparse attention
+
+With MindIE-SD exposing `mindiesd.parallel.distributed_sparse_attention` and
+`ParallelState`, MiniMax-H3 delegates eligible pure Ulysses calls directly to
+MindIE-SD before Omni exchanges Q/K/V. MindIE-SD owns the forward and reverse
+all-to-all, including chunking, Q/K/V prepacking, reorder mapping caches and
+writing inverse-reordered output into communication buffers. A caller-owned
+state is shared by layers using the same Ulysses communicator and device.
+
+This path supports BF16 inputs with `block_sparse.precision: bf16` (the
+default) or `mix`. BF16 uses BF16 communication and BSA; `mix` uses quantized
+communication and BSA. Transformer `int8` quantization affects linear layers
+and does not select attention precision. Effective attention KV precision and
+its layer/step exclusions still take precedence; floating-point exclusions
+select BF16 sparse attention. RainFusion's sparse step, layer and video-layout
+gates still determine whether a call is sparse.
+
+Admission requires one packed request, equal Q/K/V, head counts divisible by
+the Ulysses degree, and strict Ulysses mode without Ring or AllGather-KV.
+Paged KV, joint Q/K/V, reference-KV reuse, VSA compression and VDN retain the
+existing Omni attention path. Unsupported calls decline before any MindIE
+communication; errors from an admitted call propagate without retry.
+
 ## Wan2.2 T2V quantization on Ascend
 
 `RAINFUSION_ATTN` accepts `diffusion_kv_cache_dtype: fp8` or `mxfp4` for

@@ -786,6 +786,14 @@ class MiniMaxH3Attention(nn.Module):
             extra=extra,
             video_layout=video_layout,
         )
+        if num_requests == 1:
+            from .attention.mindiesd_parallel import try_distributed_sparse_attention
+
+            parallel_out = try_distributed_sparse_attention(
+                self.attention, q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), metadata
+            )
+            if parallel_out is not None:
+                return parallel_out.squeeze(0)
         return self.attention(
             q.unsqueeze(0),
             k.unsqueeze(0),

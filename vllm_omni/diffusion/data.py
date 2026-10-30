@@ -2169,8 +2169,11 @@ class BlockSparseSpec:
     precision: str = RainFusionPrecision.BF16.value
     skip_layers: str | list[int] | None = None
     skip_layer_indices: set[int] | None = field(default=None, repr=False)
+    overlap_comm: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.overlap_comm, bool):
+            raise ValueError("block_sparse.overlap_comm must be a boolean.")
         self.sparsity = _in_range(self.sparsity, "block_sparse.sparsity", 0.0, 1.0) or 0.0
         if self.start_step < 0:
             raise ValueError(f"block_sparse.start_step must be >= 0; got {self.start_step!r}.")
@@ -2298,6 +2301,8 @@ class AttentionSpec:
             kw["start_step"] = bs.start_step
             kw["end_step"] = bs.end_step
             kw["precision"] = bs.precision
+            if bs.overlap_comm:
+                kw["overlap_comm"] = True
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
 

@@ -228,6 +228,20 @@ class TestAttentionSpec:
             "precision": "fp8",
         }
 
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_block_sparse_overlap_comm_cli_mapping(self, enabled):
+        spec = AttentionSpec(
+            backend="RAINFUSION_ATTN",
+            block_sparse={"sparsity": 0.8, "overlap_comm": enabled},
+        )
+        assert spec.block_sparse.overlap_comm is enabled
+        assert spec.backend_kwargs().get("overlap_comm", False) is enabled
+
+    @pytest.mark.parametrize("invalid", [0, 1, "true", None])
+    def test_block_sparse_overlap_comm_rejects_non_boolean(self, invalid):
+        with pytest.raises(ValueError, match="overlap_comm must be a boolean"):
+            AttentionSpec(backend="RAINFUSION_ATTN", block_sparse={"overlap_comm": invalid})
+
     def test_block_sparse_precision_enum_input_normalized(self):
         """RainFusionPrecision enum members must normalize to their string value.
 
