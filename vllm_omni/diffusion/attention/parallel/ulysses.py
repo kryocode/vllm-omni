@@ -275,6 +275,35 @@ class UlyssesParallelAttention:
     def name(self) -> str:
         return "ulysses"
 
+    def _scatter_heads(self, tensor: torch.Tensor, slot: str) -> torch.Tensor:
+        """Independent operand hook; Q/K/V/gate retain separate transport storage."""
+        world = self._sp_group.ulysses_world_size
+        if _a2a_permute_enabled(self._ulysses_a2a_permute, self._scatter_idx, self._gather_idx, world):
+            from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd
+
+            return ulysses_qkv_fwd(tensor, self._ulysses_pg.group_name, world)
+        return SeqAllToAll4D.apply(self._ulysses_pg, tensor, self._scatter_idx, self._gather_idx, self._use_sync)
+
+    def _exchange_qkv(self, query, key, value, attn_metadata):
+        """PR #7990 extension point, preserving main's grouped fast transport."""
+        world = self._sp_group.ulysses_world_size
+        if _a2a_permute_enabled(self._ulysses_a2a_permute, self._scatter_idx, self._gather_idx, world):
+            from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd_group
+
+            return ulysses_qkv_fwd_group(query, key, value, self._ulysses_pg.group_name, world)
+        return self._scatter_heads(query, "q"), self._scatter_heads(key, "k"), self._scatter_heads(value, "v")
+
+    def _gather_heads(self, tensor: torch.Tensor, ctx: _UlyssesCtx) -> torch.Tensor:
+        world = dist.get_world_size(ctx.ulysses_pg)
+        if _a2a_permute_enabled(self._ulysses_a2a_permute, ctx.scatter_idx, ctx.gather_idx, world):
+            from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
+
+            output = ulysses_o_rev(tensor, ctx.ulysses_pg.group_name, world)
+            if ctx.use_sync:
+                current_omni_platform.synchronize()
+            return output
+        return SeqAllToAll4D.apply(ctx.ulysses_pg, tensor, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync)
+
     def pre_attention(
         self,
         query: torch.Tensor,
@@ -542,35 +571,13 @@ class UlyssesParallelAttention:
                         f"Try ulysses_degree in {supported}, or set ulysses_mode='advanced_uaa'."
                     )
 
-            # (bs, seq_len/P, head_cnt, head_size) -> (bs, seq_len, head_cnt/P, head_size)
-            if _a2a_permute_enabled(
-                self._ulysses_a2a_permute,
-                self._scatter_idx,
-                self._gather_idx,
-                ulysses_world_size,
+            query, key, value = self._exchange_qkv(query, key, value, attn_metadata)
+            if gate_compress is not None:
+                gate_compress = self._scatter_heads(gate_compress, "g")
+            if self._use_sync and _a2a_permute_enabled(
+                self._ulysses_a2a_permute, self._scatter_idx, self._gather_idx, ulysses_world_size
             ):
-                # Keep optional transports lazy so default Ulysses does not
-                # require the CUDA symmetric-memory or Triton backends.
-                from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd, ulysses_qkv_fwd_group
-
-                group_name = self._ulysses_pg.group_name
-                query, key, value = ulysses_qkv_fwd_group(query, key, value, group_name, ulysses_world_size)
-                if gate_compress is not None:
-                    gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
-                if self._use_sync:
-                    current_omni_platform.synchronize()
-            else:
-                query = SeqAllToAll4D.apply(
-                    self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync
-                )
-                key = SeqAllToAll4D.apply(self._ulysses_pg, key, self._scatter_idx, self._gather_idx, self._use_sync)
-                value = SeqAllToAll4D.apply(
-                    self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync
-                )
-                if gate_compress is not None:
-                    gate_compress = SeqAllToAll4D.apply(
-                        self._ulysses_pg, gate_compress, self._scatter_idx, self._gather_idx, self._use_sync
-                    )
+                current_omni_platform.synchronize()
             seq_lens = []
             local_seq_len = 0
             orig_head_cnt = 0
@@ -685,25 +692,8 @@ class UlyssesParallelAttention:
                     orig_head_cnt=ctx.orig_head_cnt,
                     use_sync=ctx.use_sync,
                 )
-            elif _a2a_permute_enabled(
-                self._ulysses_a2a_permute,
-                ctx.scatter_idx,
-                ctx.gather_idx,
-                dist.get_world_size(ctx.ulysses_pg),
-            ):
-                from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
-
-                output_img = ulysses_o_rev(
-                    output_img,
-                    ctx.ulysses_pg.group_name,
-                    dist.get_world_size(ctx.ulysses_pg),
-                )
-                if ctx.use_sync:
-                    current_omni_platform.synchronize()
             else:
-                output_img = SeqAllToAll4D.apply(
-                    ctx.ulysses_pg, output_img, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync
-                )
+                output_img = self._gather_heads(output_img, ctx)
 
             # 2. Process Joint part: AllGather on Heads
             # Input: (B, JointLen, H/P, D). Output: (B, JointLen, H, D).
@@ -732,20 +722,4 @@ class UlyssesParallelAttention:
                 orig_head_cnt=ctx.orig_head_cnt,
                 use_sync=ctx.use_sync,
             )
-        if _a2a_permute_enabled(
-            self._ulysses_a2a_permute,
-            ctx.scatter_idx,
-            ctx.gather_idx,
-            dist.get_world_size(ctx.ulysses_pg),
-        ):
-            from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
-
-            output = ulysses_o_rev(
-                attn_output,
-                ctx.ulysses_pg.group_name,
-                dist.get_world_size(ctx.ulysses_pg),
-            )
-            if ctx.use_sync:
-                current_omni_platform.synchronize()
-            return output
-        return SeqAllToAll4D.apply(ctx.ulysses_pg, attn_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync)
+        return self._gather_heads(attn_output, ctx)

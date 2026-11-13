@@ -22,6 +22,7 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
 )
+from vllm_omni.diffusion.layers.minimax_h3_feature_dispatch import request_scope
 from vllm_omni.diffusion.sampler import SamplingState, sampler_object
 from vllm_omni.platforms import current_omni_platform
 
@@ -169,6 +170,9 @@ class MiniMaxH3DenoiseBranch:
         ``static_kwargs`` makes every model call reuse the exact same BF16
         tensor without extending its lifetime beyond this request branch.
         """
+        from .attention.rf_reorder_hoist import maybe_hoist_branch
+
+        maybe_hoist_branch(self, model)
         prepare = getattr(model, "prepare_rope_table", None)
         if not callable(prepare):
             return
@@ -314,6 +318,7 @@ def minimax_h3_prepare_denoise_rows(
     return video_rows, audio_rows
 
 
+@request_scope
 def minimax_h3_denoise_loop(
     *,
     model: Any,
