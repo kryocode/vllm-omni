@@ -2271,8 +2271,19 @@ class BlockSparseSpec:
     precision: str = RainFusionPrecision.BF16.value
     skip_layers: str | list[int] | None = None
     skip_layer_indices: set[int] | None = field(default=None, repr=False)
+    overlap_comm: bool = False
+    sparse_type: str = "rf_v2"
+    parallel: dict | None = None
 
     def __post_init__(self) -> None:
+        if self.sparse_type not in ("rf_v2", "rf_v3"):
+            raise ValueError("block_sparse.sparse_type must be rf_v2 or rf_v3")
+        if self.parallel is not None:
+            from vllm_omni.diffusion.distributed.mindiesd_config import MindIEParallelConfig
+
+            MindIEParallelConfig(**self.parallel)
+        if not isinstance(self.overlap_comm, bool):
+            raise ValueError("block_sparse.overlap_comm must be a boolean.")
         self.sparsity = _in_range(self.sparsity, "block_sparse.sparsity", 0.0, 1.0) or 0.0
         if self.start_step < 0:
             raise ValueError(f"block_sparse.start_step must be >= 0; got {self.start_step!r}.")
@@ -2400,6 +2411,12 @@ class AttentionSpec:
             kw["start_step"] = bs.start_step
             kw["end_step"] = bs.end_step
             kw["precision"] = bs.precision
+            if bs.sparse_type != "rf_v2":
+                kw["sparse_type"] = bs.sparse_type
+            if bs.overlap_comm:
+                kw["overlap_comm"] = True
+            if bs.parallel is not None:
+                kw["parallel"] = dict(bs.parallel)
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
 

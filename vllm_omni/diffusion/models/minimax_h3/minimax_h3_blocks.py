@@ -38,6 +38,7 @@ from vllm_omni.diffusion.layers.indexed_modulation import (
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.offloader.module_residency import BoundedAllocatorCache, PinnedModuleStager
+from vllm_omni.platforms import current_omni_platform
 
 from .adaln_cache import MiniMaxH3RuntimeAdalnCache
 from .vdnh3 import VDNConfig, VDNH3HybridAttention
@@ -468,6 +469,18 @@ class MiniMaxH3Attention(nn.Module):
             extra=extra,
             video_layout=video_layout,
         )
+        if num_requests == 1:
+            from .attention.mindiesd_parallel import try_distributed_sparse_attention
+
+            parallel_out = try_distributed_sparse_attention(
+                self.attention, q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), metadata
+            )
+            if parallel_out is not None:
+                return parallel_out.squeeze(0)
+            if video_layout is not None and video_layout.pre_rearranged:
+                impl, effective_backend, _ = self.attention.effective_attention()
+                if effective_backend.get_name() != "RAINFUSION_ATTN" or impl._resolve_plan(metadata) is not None:
+                    raise ValueError("RF-reordered sparse rows require the admitted MindIE parallel executor")
         return self.attention(
             q.unsqueeze(0),
             k.unsqueeze(0),
@@ -476,7 +489,11 @@ class MiniMaxH3Attention(nn.Module):
         ).squeeze(0)
 
     def _project_qkv(
-        self, x: torch.Tensor, rope_table: torch.Tensor | None, vdn_window: VDNLayout | None = None
+        self,
+        x: torch.Tensor,
+        rope_table: torch.Tensor | None,
+        vdn_window: VDNLayout | None = None,
+        video_layout: VideoTokenLayout | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project/normalize/rotate QKV, retaining raw Q/K for the VDN branch."""
         total = x.shape[0]
@@ -491,6 +508,20 @@ class MiniMaxH3Attention(nn.Module):
             raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
         # The VDN linear branch reads the raw projections; norm/RoPE are out of place.
         q_raw, k_raw = q, k
+        if self.vdn is None:
+            from .attention.head_major_qkv import maybe_head_major_qkv
+
+            fused = maybe_head_major_qkv(
+                self.attention,
+                qkv,
+                rope_table,
+                video_layout,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.q_norm.variance_epsilon,
+            )
+            if fused is not None:
+                return (*fused, q_raw, k_raw)
         if rope_table is None:
             q = self.q_norm(q)
             k = self.k_norm(k)
@@ -542,7 +573,7 @@ class MiniMaxH3Attention(nn.Module):
                 reference_kv_state.local_sequence_rows,
                 projected_rows=total,
             )
-        q, k, v, q_raw, k_raw = self._project_qkv(x, rope_table, vdn_window)
+        q, k, v, q_raw, k_raw = self._project_qkv(x, rope_table, vdn_window, video_layout)
 
         # The gate is projected from the same local rows as Q. Pure Ulysses
         # reshards it alongside Q/K/V in UlyssesParallelAttention so each VSA
@@ -603,6 +634,7 @@ class MiniMaxH3MLP(nn.Module):
             prefix=f"{prefix}.fc1",
         )
         self.act_fn = SiluAndMul()
+        self._h3_main_mlp = "token_refiner" not in prefix and "blocks" in prefix.split(".")
         # Chunk the fused fc1 output as [gate, up], then compute
         # silu(gate) * up.
         self.fc2 = RowParallelLinear(
@@ -616,8 +648,20 @@ class MiniMaxH3MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from vllm_omni.diffusion.layers import minimax_h3_acceleration as features
+
+        fused = self._h3_main_mlp and features.enabled("qbmm_swiglu") and current_omni_platform.is_npu()
+        if fused:
+            from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
+
+            if not isinstance(self.fc1.quant_method, NPUInt8LinearMethod) or self.fc1.tp_size != 1:
+                raise ValueError("H3 QBMM SwiGLU requires TP1 and finalized NPU INT8 fc1")
+            self.fc1._h3_qbmm_swiglu_fused = True
         hidden, _ = self.fc1(x)
-        hidden = self.act_fn(hidden)
+        if fused:
+            features.count("qbmm_swiglu_activation_skipped")
+        else:
+            hidden = self.act_fn(hidden)
         out, _ = self.fc2(hidden)
         return out
 
@@ -752,6 +796,11 @@ class MiniMaxH3AdalnProj(nn.Module):
 
 
 class MiniMaxH3DiTBlock(nn.Module):
+    def get_layerwise_weight_nz_policy(self):
+        from .npu.weight_nz import nz_mode, nz_reactor_weight_names, weight_nz_enabled
+
+        return (nz_mode(), nz_reactor_weight_names) if self._h3_main_block and weight_nz_enabled() else (None, None)
+
     def __init__(
         self,
         arch: MiniMaxH3DiTArchConfig,
@@ -764,6 +813,7 @@ class MiniMaxH3DiTBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_index = int(layer_index)
+        self._h3_main_block = "token_refiner" not in prefix and "blocks" in prefix.split(".")
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
         # The prefix also carries the block index that block-sparse attention
@@ -832,13 +882,17 @@ class MiniMaxH3DiTBlock(nn.Module):
         ) = self.adaln_proj(t_emb)
 
         residual = x
-        h = rms_norm_indexed_scale_shift(
+        from vllm_omni.diffusion.layers import minimax_h3_feature_dispatch as dispatch
+
+        h = dispatch.norm_modulate(
+            rms_norm_indexed_scale_shift,
             x,
             self.norm1.weight,
             shift_msa,
             scale_msa,
             combined_indices,
             self.norm1.variance_epsilon,
+            admitted=self._h3_main_block,
         )
         h = self.attn(
             h,
@@ -855,7 +909,8 @@ class MiniMaxH3DiTBlock(nn.Module):
             reference_kv_compact=reference_kv_compact,
             vdn_window=vdn_window,
         )
-        x, h = indexed_gate_rms_norm_scale_shift(
+        x, h = dispatch.gate_norm(
+            indexed_gate_rms_norm_scale_shift,
             residual,
             gate_msa,
             h,
@@ -864,7 +919,10 @@ class MiniMaxH3DiTBlock(nn.Module):
             scale_mlp,
             combined_indices,
             self.norm2.variance_epsilon,
+            admitted=self._h3_main_block,
         )
         residual = x
         h = self.mlp(h)
-        return indexed_gate(residual, gate_mlp, h, combined_indices)
+        return dispatch.indexed_gate(
+            indexed_gate, residual, gate_mlp, h, combined_indices, admitted=self._h3_main_block
+        )

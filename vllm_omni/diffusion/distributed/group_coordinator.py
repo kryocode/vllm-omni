@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2024 xDiT team.
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
@@ -1044,8 +1047,12 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self.ring_rank = torch.distributed.get_rank(self.ring_group)
         self.allgather_world_size = torch.distributed.get_world_size(self.allgather_group)
         self.allgather_rank = torch.distributed.get_rank(self.allgather_group)
+        from .resources import SequenceParallelResources
+
+        self.resources = SequenceParallelResources()
 
     def destroy(self):
+        self.resources.close()
         groups = [self.ulysses_group, self.ring_group, self.allgather_group]
         seen = {id(self.device_group), id(self.cpu_group)}
         for group in groups:

@@ -1045,6 +1045,9 @@ class MiniMaxH3DiTModel(nn.Module):
         return super()._apply(fn, recurse=recurse)
 
     def post_load_weights(self) -> None:
+        from .npu.weight_nz import install_minimax_h3_dit_weight_nz
+
+        install_minimax_h3_dit_weight_nz(self, self.od_config)
         for name, param in self.named_parameters():
             if name in MINIMAX_H3_FP32_PARAM_NAMES and param.dtype != _FP32_DTYPE:
                 raise ValueError(f"{name} must stay fp32 after load, got {param.dtype}.")

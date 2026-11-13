@@ -202,6 +202,9 @@ class MiniMaxH3ModelBatch:
             if reference_kv_state is not None:
                 reference_kv_state.begin_step(evaluations[0].state.step_index, sigma=float(evaluations[0].sigmas[0]))
             video, audio = models[0].transformer(**kwargs)
+            from vllm_omni.diffusion.layers.minimax_h3_acceleration import count
+
+            count("model_evaluations")
             if reference_kv_state is not None:
                 reference_kv_state.end_step()
             check_request_cancellation()

@@ -81,6 +81,10 @@ class LayerwiseOffloadHook(ModelHook):
         self.dtype_cpu_flattened_weights: dict[torch.dtype, torch.Tensor] = {}
         self.dtype_metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
         self._materialization_probe = materialization_probe_tensor
+        self._weight_nz_mode: str | None = None
+        self._nz_weight_names: set[str] = set()
+        self._prefetch_sources: list[torch.Tensor] = []
+        self._nz_verified_count = 0
 
     def initialize_hook(self, module: nn.Module) -> nn.Module:
         # This all happen during the hook instance being registered to hook registry;
@@ -95,11 +99,22 @@ class LayerwiseOffloadHook(ModelHook):
         self.next_block_parameters: dict[str, nn.Parameter] = dict(self.next_block.named_parameters())
         self.next_block_buffers: dict[str, torch.Tensor] = dict(self.next_block.named_buffers())
 
+        policy = getattr(self.next_block, "get_layerwise_weight_nz_policy", None)
+        mode, selector = policy() if callable(policy) else (None, None)
+        self._weight_nz_mode = mode
+        if mode is not None:
+            from vllm_omni.diffusion.layers.npu_weight_layout import validate_weight_nz
+
+            validate_weight_nz(mode)
+            self._nz_weight_names = set(selector(self.next_block))
+
         # Pre-allocate gpu tensors in a flattened way
         self.dtype_cpu_flattened_weights, self.dtype_metadata = LayerwiseOffloadHook._to_cpu(
             self.next_block_parameters,
             self.next_block_buffers,
             self.pin_memory,
+            nz_weight_names=self._nz_weight_names,
+            weight_nz_mode=self._weight_nz_mode,
         )
 
         return module
@@ -109,6 +124,9 @@ class LayerwiseOffloadHook(ModelHook):
         params: dict[str, nn.Parameter],
         bufs: dict[str, torch.Tensor],
         pin_memory: bool = True,
+        *,
+        nz_weight_names: set[str] | None = None,
+        weight_nz_mode: str | None = None,
     ) -> tuple[dict[torch.dtype, torch.Tensor], dict[torch.dtype, list[dict[str, Any]]]]:
         """Helper method to move block parameters and buffers to CPU, flattening by dtype.
 
@@ -133,7 +151,14 @@ class LayerwiseOffloadHook(ModelHook):
 
             current_offset = 0
             for spec in specs:
-                flat_storage = flatten_physical_storage(spec.value, spec.storage_numel)
+                if weight_nz_mode == "reactor" and spec.name in (nz_weight_names or set()):
+                    from vllm_omni.diffusion.layers.npu_weight_layout import permute_host_weight_to_nz
+
+                    if spec.storage_numel != spec.value.numel():
+                        raise ValueError(f"NZ reactor requires an unpadded slot: {spec.name}")
+                    flat_storage = permute_host_weight_to_nz(spec.value.detach().cpu().contiguous())
+                else:
+                    flat_storage = flatten_physical_storage(spec.value, spec.storage_numel)
                 cpu_tensor[current_offset : current_offset + spec.storage_numel].copy_(flat_storage)
                 dtype_metadata.setdefault(dtype, []).append(
                     tensor_storage_metadata(spec, current_offset, include_device=True)
@@ -169,32 +194,50 @@ class LayerwiseOffloadHook(ModelHook):
         evt = current_omni_platform.Event()
         gpu_weights: dict[torch.dtype, torch.Tensor] = {}
 
+        pending_values: list[tuple[torch.Tensor, torch.Tensor]] = []
+        sources: list[torch.Tensor] = []
+        verified: set[str] = set()
         with current_omni_platform.stream(self.copy_stream):
             for dtype, cpu_weight in self.dtype_cpu_flattened_weights.items():
                 gpu_weight = torch.empty(cpu_weight.shape, dtype=dtype, device=self.device)
                 gpu_weight.copy_(cpu_weight, non_blocking=non_blocking)
                 gpu_weights[dtype] = gpu_weight
+                if self._weight_nz_mode is not None:
+                    sources.append(gpu_weight)
+            for dtype, ordered_metadata in self.dtype_metadata.items():
+                gpu_weight = gpu_weights[dtype]
+                for metadata in ordered_metadata:
+                    name = metadata["name"]
+                    target = layer_params[name] if name in layer_params else layer_bufs[name]
+                    view = gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]]
+                    value = torch.as_strided(view, size=metadata["shape"], stride=metadata["stride"])
+                    if name in self._nz_weight_names:
+                        from vllm_omni.diffusion.layers.npu_weight_layout import (
+                            get_npu_format,
+                            maybe_cast_weight_to_nz,
+                            nz_view_over_buffer,
+                        )
 
+                        value = (
+                            nz_view_over_buffer(gpu_weight, metadata["offset"], metadata["shape"], dtype)
+                            if self._weight_nz_mode == "reactor"
+                            else maybe_cast_weight_to_nz(value)
+                        )
+                        if get_npu_format(value) != 29:
+                            raise RuntimeError(f"NZ upload for {name} did not retain format 29")
+                        verified.add(name)
+                        if self._weight_nz_mode == "cast":
+                            sources.append(value)
+                    pending_values.append((target, value))
             evt.record(self.copy_stream)
-
-        for dtype, ordered_metadata in self.dtype_metadata.items():
-            # ordered_metadata: list[dict[str, Any]]
-            gpu_weight = gpu_weights[dtype]
-
-            for metadata in ordered_metadata:
-                target_name = metadata["name"]
-                target_param_or_buf = (
-                    layer_params[target_name] if target_name in layer_params else layer_bufs[target_name]
-                )
-
-                set_tensor_storage(
-                    target_param_or_buf,
-                    torch.as_strided(
-                        gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]],
-                        size=metadata["shape"],
-                        stride=metadata["stride"],
-                    ),
-                )
+        if self._weight_nz_mode is not None and verified != self._nz_weight_names:
+            raise RuntimeError("NZ upload did not verify every selected weight")
+        for target, value in pending_values:
+            set_tensor_storage(target, value)
+        self._prefetch_sources = sources
+        if self._weight_nz_mode is not None and not self._nz_verified_count:
+            self._nz_verified_count = len(verified)
+            logger.info("H3_WEIGHT_NZ_ACTUAL mode=%s format=29 weights=%d", self._weight_nz_mode, len(verified))
 
         self._prefetch_done = evt
 
@@ -218,6 +261,15 @@ class LayerwiseOffloadHook(ModelHook):
                     stride=metadata["stride"],
                 )
                 target_name = metadata["name"]
+                if self._weight_nz_mode == "reactor" and target_name in self._nz_weight_names:
+                    from vllm_omni.diffusion.layers.npu_weight_layout import unpermute_host_weight_from_nz
+
+                    raw = flat[metadata["offset"] : metadata["offset"] + metadata["numel"]]
+                    value = unpermute_host_weight_from_nz(raw, metadata["shape"], dtype)
+                    if value.stride() != tuple(metadata["stride"]):
+                        original_layout = torch.empty_strided(metadata["shape"], metadata["stride"], dtype=dtype)
+                        original_layout.copy_(value)
+                        value = original_layout
                 target = (
                     self.next_block_parameters[target_name]
                     if target_name in self.next_block_parameters
@@ -232,12 +284,24 @@ class LayerwiseOffloadHook(ModelHook):
         if not self.is_materialized and self._prev_hook is not None:
             self._prev_hook.prefetch_layer(non_blocking=False)
 
+        if self._weight_nz_mode is not None:
+            producer = self._prev_hook
+            if producer is None:
+                raise RuntimeError("NZ consumer has no producer hook")
+            if producer._prefetch_done is not None:
+                current_omni_platform.current_stream().wait_event(producer._prefetch_done)
+            if producer._nz_verified_count != len(producer._nz_weight_names):
+                raise RuntimeError("NZ consumer reached an unverified block")
+            for source in producer._prefetch_sources:
+                source.record_stream(current_omni_platform.current_stream())
         self.prefetch_layer(non_blocking=True)
 
         return args, kwargs
 
     def post_forward(self, module: nn.Module, output: Any) -> Any:
         self.offload_layer()
+        if self._weight_nz_mode is not None and self._prev_hook is not None:
+            self._prev_hook._prefetch_sources.clear()
 
         return output
 
