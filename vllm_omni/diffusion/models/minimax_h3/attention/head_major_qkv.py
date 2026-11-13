@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Use the existing SDK SNRC producer with its shared physical-layout plan."""
 
-
 from .mindiesd_parallel import _selected_config
 
 
