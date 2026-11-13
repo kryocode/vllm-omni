@@ -18,6 +18,12 @@ The integrated public SDK contracts are available in MindIE-SD branch
 with the matching native plugin and OPP packages. A Python package version
 alone does not establish that the required kernels were built.
 
+With this SDK revision, F (`modulation_fusions`) uses an indexed gate kernel
+with the legacy Triton-Ascend `tl.load(..., care_padding=False)` argument.
+Triton-Ascend 3.6.0.post2 does not accept that argument. Leave F disabled on
+that stack; the other features can run with the unmodified SDK. This integration
+does not patch the SDK or substitute a different kernel when F is selected.
+
 Use BF16 activations, one packed request, TP1, pure strict Ulysses, and
 ordinary layerwise offload for the complete configuration. The H3 production
 configuration uses eight Ascend 910B cards. Head-major QKV has a narrower
@@ -46,7 +52,7 @@ accepts a comma-separated set; selecting one feature does not select another.
 | H | Separate head-major switch | SNRC BNSD storage and SDK contiguous round-robin send views |
 
 ```bash
-export VLLM_OMNI_MINIMAX_H3_ACCELERATION_FEATURES=dual_stream_attention,attention_pipeline_optimizations,weight_nz,eagle_bsa,split_norm_rope_concat,modulation_fusions,qbmm_swiglu
+export VLLM_OMNI_MINIMAX_H3_ACCELERATION_FEATURES=dual_stream_attention,attention_pipeline_optimizations,weight_nz,eagle_bsa,split_norm_rope_concat,qbmm_swiglu
 export VLLM_OMNI_MINIMAX_H3_HEAD_MAJOR_QKV=1
 export VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ_MODE=reactor
 export VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE=2
@@ -57,6 +63,9 @@ The HCCL setting controls only Ulysses process groups: `2` selects AICPU and
 groups keep their configuration. H requires A, B and E together. Set
 `VLLM_OMNI_MINIMAX_H3_RF_HOIST_REORDER=0` to disable only B's global reorder;
 H must also be disabled in that configuration.
+
+The example enables A–E, G and H. Add `modulation_fusions` only when the SDK's
+indexed gate kernel is compatible with the installed Triton-Ascend version.
 
 C supports `reactor` and `cast`. Reactor packs aligned CPU master weights once,
 uploads their raw slots and constructs non-owning format-29 views. The offload
@@ -139,6 +148,8 @@ counters in `[MINIMAX_H3_FEATURE_STATS]`. On the 50-block, NFE8 configuration,
 A/D/E/F/G each execute 400 times per participating rank. H should report
 400 head-major calls, 1,200 contiguous send views and 400 round-robin merges.
 Inspect actual `last_call_stats`; a requested flag alone is not engagement.
+For the F-disabled configuration, all F counters must be zero, while the
+enabled A–E, G and H counters must still satisfy their contracts.
 
 The SNRC, QBMM and head-major VERIFY switches are diagnostics and default off.
 Disable them for formal timing. C/B/H storage operations require bit-equivalence
@@ -159,3 +170,23 @@ monotonic timestamps, rank and duration. With diagnostics enabled, `nfe`
 counts successful transformer evaluations rather than inferring them from
 the requested step count. This observer defaults off and must be symmetric
 between the compared configurations.
+
+### Recorded Ascend experiment
+
+On main `d112af22e4e21af3976e6f83c342d77898a96e0f` plus this integration,
+one Ref2VA case at 480×864, seed 42 and NFE8 was measured on eight Ascend 910B
+cards. Both service windows completed two full warmups and three formal requests.
+The candidate enabled A–E, G and H; F was disabled in both arms.
+
+| Metric | All features off | A–E, G and H on | Time reduction |
+| --- | --- | --- | --- |
+| Mean E2E | 35.797 s | 34.931 s | 2.42% |
+| Mean maximum-rank DiT | 21.609 s | 18.954 s | 12.29% |
+
+This used vLLM 0.33.0, torch/torch_npu 2.10, CANN 9.0.1 and Triton-Ascend
+3.6.0.post2, with a Python-only vLLM-Ascend installation and the SDK's native
+operators. Complete media decoding and feature counters passed. The two
+configurations produced different media: decoded video SSIM was 0.720 and
+audio waveform cosine was 0.574. These timing observations do not establish
+output equivalence or dataset-level quality acceptance. CUDA/ROCm and
+FlashInfer RDMA were not hardware-tested by this experiment.
