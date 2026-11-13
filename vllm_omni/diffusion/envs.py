@@ -31,8 +31,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
     "LOCAL_RANK": lambda: int(os.environ.get("LOCAL_RANK", "0")),
-    # Explicit HCCL Ulysses transport selection: 2=AICPU, 3=AIV.
-    # Unset preserves the runtime default; affects only Ulysses groups.
+    # Select the HCCL execution engine only for Ulysses process groups.
+    # 2=AICPU, 3=AIV; unset keeps the HCCL runtime default.
     "VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE": lambda: (
         int(os.environ["VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE"])
         if "VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE" in os.environ

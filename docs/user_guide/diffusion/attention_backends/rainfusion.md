@@ -90,12 +90,10 @@ all-to-all, including chunking, Q/K/V prepacking, reorder mapping caches and
 writing inverse-reordered output into communication buffers. A caller-owned
 state is shared by layers using the same Ulysses communicator and device.
 
-This path supports BF16 inputs with `block_sparse.precision: bf16` (the
-default) or `mix`. BF16 uses BF16 communication and BSA; `mix` uses quantized
-communication and BSA. Transformer `int8` quantization affects linear layers
-and does not select attention precision. Effective attention KV precision and
-its layer/step exclusions still take precedence; floating-point exclusions
-select BF16 sparse attention. RainFusion's sparse step, layer and video-layout
+This path deliberately supports only BF16 inputs with
+`block_sparse.precision: bf16`, `sparse_type: rf_v3`, and the stock CANN
+consumer. Transformer `int8` quantization affects linear layers and does not
+select attention precision. RainFusion's sparse step, layer and video-layout
 gates still determine whether a call is sparse.
 
 Admission requires one packed request, equal Q/K/V, head counts divisible by
@@ -104,7 +102,7 @@ Paged KV, joint Q/K/V, reference-KV reuse, VSA compression and VDN retain the
 existing Omni attention path. Unsupported calls decline before any MindIE
 communication; errors from an admitted call propagate without retry.
 
-For full A–H feature controls, state lifetime and measurement requirements, see
+For state lifetime, request-level RF reorder and validation requirements, see
 [MiniMax-H3 MindIE-SD acceleration](../parallelism/mindiesd.md).
 
 ## Wan2.2 T2V quantization on Ascend

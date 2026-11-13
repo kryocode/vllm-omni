@@ -240,18 +240,25 @@ class TestAttentionSpec:
         }
 
     @pytest.mark.parametrize("enabled", [False, True])
-    def test_block_sparse_overlap_comm_cli_mapping(self, enabled):
+    def test_block_sparse_parallel_config_forwarded(self, enabled):
         spec = AttentionSpec(
             backend="RAINFUSION_ATTN",
-            block_sparse={"sparsity": 0.8, "overlap_comm": enabled},
+            block_sparse={
+                "sparsity": 0.8,
+                "sparse_type": "rf_v3",
+                "parallel": {"overlap_comm": enabled, "reorder_hoist": True},
+            },
         )
-        assert spec.block_sparse.overlap_comm is enabled
-        assert spec.backend_kwargs().get("overlap_comm", False) is enabled
+        assert spec.backend_kwargs()["parallel"] == {"overlap_comm": enabled, "reorder_hoist": True}
+        assert spec.backend_kwargs()["sparse_type"] == "rf_v3"
 
     @pytest.mark.parametrize("invalid", [0, 1, "true", None])
-    def test_block_sparse_overlap_comm_rejects_non_boolean(self, invalid):
-        with pytest.raises(ValueError, match="overlap_comm must be a boolean"):
-            AttentionSpec(backend="RAINFUSION_ATTN", block_sparse={"overlap_comm": invalid})
+    def test_block_sparse_parallel_rejects_ambiguous_booleans(self, invalid):
+        with pytest.raises(ValueError, match="must be a boolean"):
+            AttentionSpec(
+                backend="RAINFUSION_ATTN",
+                block_sparse={"parallel": {"overlap_comm": invalid}},
+            )
 
     def test_block_sparse_precision_enum_input_normalized(self):
         """RainFusionPrecision enum members must normalize to their string value.

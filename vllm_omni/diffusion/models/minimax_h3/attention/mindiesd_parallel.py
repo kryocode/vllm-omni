@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.mindiesd_config import MindIEParallelConfig
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
 
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
     from vllm_omni.diffusion.attention.layer import Attention
+
+logger = init_logger(__name__)
 
 
 class MindIEParallelResource:
@@ -42,11 +45,12 @@ class MindIEParallelResource:
         self.state: ParallelState | None = ParallelState(
             group=group,
             overlap_comm=config.overlap_comm,
-            optimize_attention_pipeline=config.optimize_attention_pipeline,
-            bsa_backend=config.bsa_backend,
+            optimize_attention_pipeline=True,
+            bsa_backend="cann",
         )
         self.failed = False
         self.active = False
+        self.completed_calls = 0
 
     def execute(
         self,
@@ -60,7 +64,6 @@ class MindIEParallelResource:
         scale: float,
         sparsity: float,
         pre_rearranged: bool,
-        head_major_qkv: bool | None = None,
     ) -> torch.Tensor:
         if self.state is None or self.failed:
             raise RuntimeError("MindIE parallel resource is closed or failed; recreate the worker")
@@ -68,22 +71,6 @@ class MindIEParallelResource:
             raise RuntimeError("concurrent calls cannot share a MindIE parallel resource")
         from mindiesd.parallel import distributed_sparse_attention
 
-        from vllm_omni.diffusion.layers import minimax_h3_acceleration as features
-
-        requested = self.config.head_major_qkv if head_major_qkv is None else head_major_qkv
-        self.state.qkv_layout_plan = features.qkv_layout_plan(
-            head_count=q.shape[2],
-            head_dim=q.shape[3],
-            batch_size=q.shape[0],
-            world=dist.get_world_size(self.group),
-            chunking=q.shape[2] // dist.get_world_size(self.group),
-            precision=precision,
-            sparse_type=self.config.sparse_type,
-            pre_rearranged=pre_rearranged,
-            overlap_comm=self.config.overlap_comm,
-            optimize_attention_pipeline=self.config.optimize_attention_pipeline,
-            requested=requested,
-        )
         self.active = True
         try:
             output = distributed_sparse_attention(
@@ -93,38 +80,16 @@ class MindIEParallelResource:
                 spans,
                 group=self.group,
                 state=self.state,
-                sparse_type=self.config.sparse_type,
+                sparse_type="rf_v3",
                 used_len=used_len,
                 precision=precision,
                 scale=scale,
                 sparsity=sparsity,
                 pre_rearranged=pre_rearranged,
             )
-            features.count("distributed_attention_calls")
-            if features.DIAGNOSTICS:
-                stats = self.state.last_call_stats
-                if stats is None:
-                    raise RuntimeError("MindIE diagnostics require successful public last_call_stats")
-                actual = stats["actual"]
-                for name in (
-                    "head_major_qkv_calls",
-                    "head_major_qkv_view_calls",
-                    "round_robin_merge_calls",
-                    "qkv_receive_allocations",
-                    "qkv_receive_reuses",
-                ):
-                    features.count(name, actual[name])
-                if requested and not actual["head_major_qkv_calls"]:
-                    features.count("head_major_qkv_fallback_calls")
-                features.count("bsa_" + actual["bsa_backend"])
-                features.count("pre_rearranged_calls" if pre_rearranged else "original_order_calls")
-                features.count(
-                    "optimized_pipeline_calls"
-                    if self.config.optimize_attention_pipeline
-                    else "unoptimized_pipeline_calls"
-                )
+            self.completed_calls += 1
             return output
-        except BaseException:
+        except Exception:
             # No alternate transport or replay after a partial collective.
             self.failed = True
             raise
@@ -140,31 +105,13 @@ class MindIEParallelResource:
         # releasing their buffers; failure leaves state and storage intact.
         with torch.npu.device(self.device):
             current_omni_platform.synchronize()
+        logger.info("MiniMax-H3 MindIE-SD pipeline completed_calls=%d", self.completed_calls)
         self.state = None
         gc.collect()
 
 
 def _selected_config(impl) -> MindIEParallelConfig | None:
-    from vllm_omni.diffusion.layers import minimax_h3_acceleration as features
-
-    config = impl.rainfusion.parallel
-    if config is None and features.enabled("dual_stream_attention"):
-        optimized = features.enabled("attention_pipeline_optimizations")
-        import os
-
-        hoist = optimized and os.environ.get("VLLM_OMNI_MINIMAX_H3_RF_HOIST_REORDER", "1") == "1"
-        return MindIEParallelConfig(
-            overlap_comm=True,
-            optimize_attention_pipeline=optimized,
-            bsa_backend="eagle" if features.enabled("eagle_bsa") else "cann",
-            sparse_type="rf_v3",
-            reorder_hoist=hoist,
-            head_major_qkv=features.head_major_qkv_enabled(),
-        )
-    if config is None and impl.rainfusion.overlap_comm:
-        # Preserve the existing explicit overlap_comm configuration route.
-        return MindIEParallelConfig(overlap_comm=True)
-    return config
+    return impl.rainfusion.parallel
 
 
 def try_distributed_sparse_attention(
@@ -181,6 +128,8 @@ def try_distributed_sparse_attention(
     config = _selected_config(impl)
     if config is None:
         return None
+    if impl.rainfusion.precision != "bf16" or impl.rainfusion.sparse_type != "rf_v3":
+        raise ValueError("MindIE parallel requires block_sparse precision='bf16' and sparse_type='rf_v3'")
     if (
         attention.causal
         or attention.qkv_layout != "BSND"
@@ -234,19 +183,16 @@ def try_distributed_sparse_attention(
     if plan is None or not 0 < plan.used_len <= world * query.shape[1]:
         return None
     precision = effective_metadata.extra.get("kv_cache_dtype", impl.rainfusion.precision)
-    if precision == "float":
-        precision = "bf16"
-    if precision not in ("bf16", "mix"):
+    if precision not in ("float", "bf16"):
         return None
+    precision = "bf16"
     pre_rearranged = bool(getattr(metadata.video_layout, "pre_rearranged", False))
-    if (pre_rearranged or config.bsa_backend == "eagle") and precision != "bf16":
-        raise ValueError("MindIE RF reorder hoist and Eagle BSA require BF16 precision")
     spans = plan.video_spans or [{"start": plan.prefix_len, "latent_shape": list(plan.latent_shape)}]
     resource = coordinator.resources.get_or_create(
         ("mindiesd", group, query.device),
         lambda: MindIEParallelResource(group, query.device, config),
     )
-    fixed = ("overlap_comm", "optimize_attention_pipeline", "bsa_backend", "sparse_type")
+    fixed = ("overlap_comm",)
     if any(getattr(resource.config, name) != getattr(config, name) for name in fixed):
         raise RuntimeError("MindIE parallel configuration must agree across layers sharing a communicator/device")
     return resource.execute(
@@ -259,5 +205,4 @@ def try_distributed_sparse_attention(
         scale=impl.softmax_scale,
         sparsity=impl.rainfusion.sparsity,
         pre_rearranged=pre_rearranged,
-        head_major_qkv=config.head_major_qkv,
     )

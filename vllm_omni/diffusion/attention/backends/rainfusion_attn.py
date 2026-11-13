@@ -106,7 +106,6 @@ class RainFusionConfig:
     start_step: int = 0
     end_step: int = 0
     precision: str = "bf16"
-    overlap_comm: bool = False
     sparse_type: str = "rf_v2"
     parallel: MindIEParallelConfig | None = None
     skip_layers: frozenset[int] = frozenset()
@@ -114,9 +113,6 @@ class RainFusionConfig:
     @classmethod
     def from_backend_kwargs(cls, backend_kwargs: dict | None) -> RainFusionConfig:
         bk = backend_kwargs or {}
-        overlap_comm = bk.get("overlap_comm", False)
-        if not isinstance(overlap_comm, bool):
-            raise ValueError("RainFusion overlap_comm must be a boolean and agree across ranks")
         sparse_type = bk.get("sparse_type", "rf_v2")
         if sparse_type not in ("rf_v2", "rf_v3"):
             raise ValueError("RainFusion sparse_type must be rf_v2 or rf_v3")
@@ -125,7 +121,6 @@ class RainFusionConfig:
             start_step=int(bk.get("start_step", 0)),
             end_step=int(bk.get("end_step", 0)),
             precision=str(bk.get("precision", "bf16")),
-            overlap_comm=overlap_comm,
             sparse_type=sparse_type,
             parallel=MindIEParallelConfig(**bk["parallel"]) if bk.get("parallel") is not None else None,
             skip_layers=frozenset(bk.get("skip_layers") or ()),

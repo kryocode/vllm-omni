@@ -526,19 +526,14 @@ class NPUInt8LinearMethod(BaseInt8LinearMethod):
         x = x.reshape(-1, ori_shape[-1])
         quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
 
-        if getattr(layer, "_h3_qbmm_swiglu_fused", False):
-            from vllm_omni.diffusion.models.minimax_h3.npu.qbmm_swiglu import fused_fc1
-
-            output = fused_fc1(quantized_x, layer.weight, layer.weight_scale, pertoken_scale, ori_dtype, bias)
-        else:
-            output = torch_npu.npu_quant_matmul(
-                quantized_x,
-                layer.weight,
-                layer.weight_scale,
-                bias=bias,
-                pertoken_scale=pertoken_scale,
-                output_dtype=ori_dtype,
-            )
+        output = torch_npu.npu_quant_matmul(
+            quantized_x,
+            layer.weight,
+            layer.weight_scale,
+            bias=bias,
+            pertoken_scale=pertoken_scale,
+            output_dtype=ori_dtype,
+        )
         output = output.reshape(*ori_shape[:-1], -1)
         return output
 

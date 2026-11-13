@@ -22,7 +22,6 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
 )
-from vllm_omni.diffusion.layers.minimax_h3_feature_dispatch import request_scope
 from vllm_omni.diffusion.sampler import SamplingState, sampler_object
 from vllm_omni.platforms import current_omni_platform
 
@@ -318,7 +317,6 @@ def minimax_h3_prepare_denoise_rows(
     return video_rows, audio_rows
 
 
-@request_scope
 def minimax_h3_denoise_loop(
     *,
     model: Any,
