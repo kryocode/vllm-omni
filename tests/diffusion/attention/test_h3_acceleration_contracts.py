@@ -5,7 +5,7 @@
 import importlib.util
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -19,6 +19,37 @@ from vllm_omni.diffusion.layers.npu_weight_layout import (
 from vllm_omni.diffusion.offloader.layerwise_backend import LayerwiseOffloadHook
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("offset", [0, 11008])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_nz_cast_normalizes_copy_source_offset_and_stride(monkeypatch, offset, transposed):
+    from vllm_omni.diffusion.layers import npu_weight_layout as layout
+
+    raw = (torch.arange(offset + 64 * 128) % 19).to(torch.bfloat16)
+    weight = raw[offset:].view(64, 128)
+    if transposed:
+        weight = weight.T
+    expected = weight.clone()
+    destination = torch.empty_like(weight, memory_format=torch.contiguous_format)
+    original_copy = torch.Tensor.copy_
+    sources = []
+
+    def checked_copy(tensor, source, *args, **kwargs):
+        if tensor is destination:
+            assert source.storage_offset() == 0
+            assert source.is_contiguous()
+            sources.append(source)
+        return original_copy(tensor, source, *args, **kwargs)
+
+    native = ModuleType("torch_npu")
+    setattr(native, "empty_with_format", lambda *args, **kwargs: destination)
+    monkeypatch.setitem(sys.modules, "torch_npu", native)
+    monkeypatch.setattr(layout, "_is_npu_weight", lambda tensor: True)
+    monkeypatch.setattr(torch.Tensor, "copy_", checked_copy)
+    actual = layout.maybe_cast_weight_to_nz(weight)
+    assert actual is destination and len(sources) == 1
+    assert torch.equal(actual, expected) and torch.equal(weight, expected)
 
 
 @pytest.mark.parametrize("dtype,shape", [(torch.int8, (64, 96)), (torch.bfloat16, (48, 64)), (torch.float16, (32, 48))])

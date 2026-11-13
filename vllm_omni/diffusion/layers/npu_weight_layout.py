@@ -42,7 +42,13 @@ def maybe_cast_weight_to_nz(weight: torch.Tensor) -> torch.Tensor:
     out = torch_npu.empty_with_format(
         tuple(weight.shape), dtype=weight.dtype, device=weight.device, acl_format=_ACL_FORMAT_FRACTAL_NZ
     )
-    out.copy_(weight)
+    # A packed upload slot may have a non-zero storage offset. CANN's ND-to-NZ
+    # copy requires a contiguous source whose logical tensor starts at offset 0.
+    # contiguous() alone retains an offset when the input is already contiguous.
+    source = weight.contiguous()
+    if source.storage_offset() != 0:
+        source = source.clone()
+    out.copy_(source)
     return out
 
 
