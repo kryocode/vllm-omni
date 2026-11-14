@@ -241,15 +241,12 @@ class TestAttentionSpec:
 
     @pytest.mark.parametrize("enabled", [False, True])
     def test_block_sparse_parallel_config_forwarded(self, enabled):
+        parallel = {"overlap_comm": enabled, "reorder_hoist": True}
         spec = AttentionSpec(
             backend="RAINFUSION_ATTN",
-            block_sparse={
-                "sparsity": 0.8,
-                "sparse_type": "rf_v3",
-                "parallel": {"overlap_comm": enabled, "reorder_hoist": True},
-            },
+            block_sparse={"sparse_type": "rf_v3", "parallel": parallel},
         )
-        assert spec.backend_kwargs()["parallel"] == {"overlap_comm": enabled, "reorder_hoist": True}
+        assert spec.backend_kwargs()["parallel"] == parallel
         assert spec.backend_kwargs()["sparse_type"] == "rf_v3"
 
     @pytest.mark.parametrize("invalid", [0, 1, "true", None])

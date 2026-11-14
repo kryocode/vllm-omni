@@ -83,27 +83,11 @@ For common configuration and selector behavior, see the
 
 ## MiniMax-H3 distributed sparse attention
 
-When explicitly enabled, with MindIE-SD exposing `mindiesd.parallel.distributed_sparse_attention` and
-`ParallelState`, MiniMax-H3 delegates eligible pure Ulysses calls directly to
-MindIE-SD before Omni exchanges Q/K/V. MindIE-SD owns the forward and reverse
-all-to-all, including chunking, Q/K/V prepacking, reorder mapping caches and
-writing inverse-reordered output into communication buffers. A caller-owned
-state is shared by layers using the same Ulysses communicator and device.
-
-This path deliberately supports only BF16 inputs with
-`block_sparse.precision: bf16`, `sparse_type: rf_v3`, and the stock CANN
-consumer. Transformer `int8` quantization affects linear layers and does not
-select attention precision. RainFusion's sparse step, layer and video-layout
-gates still determine whether a call is sparse.
-
-Admission requires one packed request, equal Q/K/V, head counts divisible by
-the Ulysses degree, and strict Ulysses mode without Ring or AllGather-KV.
-Paged KV, joint Q/K/V, reference-KV reuse, VSA compression and VDN retain the
-existing Omni attention path. Unsupported calls decline before any MindIE
-communication; errors from an admitted call propagate without retry.
-
-For state lifetime, request-level RF reorder and validation requirements, see
-[MiniMax-H3 MindIE-SD acceleration](../parallelism/mindiesd.md).
+Set `block_sparse.parallel` to use the MiniMax-H3 MindIE-SD executor with
+BF16 RF-v3 and CANN BSA. Linear-layer int8 quantization does not select
+attention precision; existing sparse step/layer gates still apply. See the
+[parallel attention guide](../parallelism/mindiesd.md) for configuration,
+supported layouts, request-level reorder and state ownership.
 
 ## Wan2.2 T2V quantization on Ascend
 

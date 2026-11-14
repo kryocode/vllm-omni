@@ -11,6 +11,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.cpu]
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -18,51 +20,50 @@ MODEL_DIR = ROOT / "vllm_omni/diffusion/models/minimax_h3"
 HELPER_NAME = "vllm_omni.diffusion.models.minimax_h3.attention.mindiesd_parallel"
 
 
-def make_metadata(**kwargs):
-    defaults = dict(
-        joint_query=None,
-        joint_key=None,
-        joint_value=None,
-        joint_attn_mask=None,
-        full_attn_spans=None,
-        attn_mask=None,
-        video_layout=None,
-    )
-    return SimpleNamespace(**(defaults | kwargs))
+def load_module(monkeypatch, name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.fixture
 def adapter(monkeypatch):
-    config_path = ROOT / "vllm_omni/diffusion/distributed/mindiesd_config.py"
-    config_name = "vllm_omni.diffusion.distributed.mindiesd_config"
-    config_spec = importlib.util.spec_from_file_location(config_name, config_path)
-    assert config_spec is not None and config_spec.loader is not None
-    config_module = importlib.util.module_from_spec(config_spec)
-    monkeypatch.setitem(sys.modules, config_name, config_module)
-    config_spec.loader.exec_module(config_module)
+    load_module(
+        monkeypatch,
+        "vllm_omni.diffusion.distributed.mindiesd_config",
+        ROOT / "vllm_omni/diffusion/distributed/mindiesd_config.py",
+    )
+    calls, states = [], []
 
-    forward_context = ModuleType("vllm_omni.diffusion.forward_context")
-    setattr(forward_context, "get_ulysses_mode", lambda **_: "strict")
+    def new_state(**kwargs):
+        state = SimpleNamespace(**kwargs)
+        states.append(state)
+        return state
+
+    def distributed_attention(q, k, v, spans, **kwargs):
+        calls.append((q, k, v, spans, kwargs))
+        return q + 1
+
     platform = SimpleNamespace(is_npu=lambda: True)
-    platforms = ModuleType("vllm_omni.platforms")
-    setattr(platforms, "current_omni_platform", platform)
-    monkeypatch.setitem(sys.modules, forward_context.__name__, forward_context)
-    monkeypatch.setitem(sys.modules, platforms.__name__, platforms)
-
-    spec = importlib.util.spec_from_file_location(HELPER_NAME, MODEL_DIR / "attention/mindiesd_parallel.py")
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, HELPER_NAME, module)
-    spec.loader.exec_module(module)
+    for name, exports in (
+        ("vllm_omni.diffusion.forward_context", {"get_ulysses_mode": lambda **_: "strict"}),
+        ("vllm_omni.platforms", {"current_omni_platform": platform}),
+        ("mindiesd.parallel", {"ParallelState": new_state, "distributed_sparse_attention": distributed_attention}),
+    ):
+        stub = ModuleType(name)
+        stub.__dict__.update(exports)
+        monkeypatch.setitem(sys.modules, name, stub)
+    module = load_module(monkeypatch, HELPER_NAME, MODEL_DIR / "attention/mindiesd_parallel.py")
     monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(module.dist, "get_world_size", lambda group: 2)
 
     group = object()
-    resources_path = ROOT / "vllm_omni/diffusion/distributed/resources.py"
-    resources_spec = importlib.util.spec_from_file_location("h3_test_resources", resources_path)
-    assert resources_spec is not None and resources_spec.loader is not None
-    resources_module = importlib.util.module_from_spec(resources_spec)
-    resources_spec.loader.exec_module(resources_module)
+    resources_module = load_module(
+        monkeypatch, "h3_test_resources", ROOT / "vllm_omni/diffusion/distributed/resources.py"
+    )
     coordinator = SimpleNamespace(
         ring_world_size=1,
         allgather_world_size=1,
@@ -76,22 +77,6 @@ def adapter(monkeypatch):
         _gather_idx=1,
         _ulysses_a2a_permute=False,
     )
-    calls, states = [], []
-
-    def new_state(**kwargs):
-        state = SimpleNamespace(**kwargs)
-        states.append(state)
-        return state
-
-    def distributed_attention(q, k, v, spans, **kwargs):
-        calls.append((q, k, v, spans, kwargs))
-        return q + 1
-
-    library = ModuleType("mindiesd.parallel")
-    setattr(library, "ParallelState", new_state)
-    setattr(library, "distributed_sparse_attention", distributed_attention)
-    monkeypatch.setitem(sys.modules, "mindiesd.parallel", library)
-
     plan = SimpleNamespace(used_len=14, video_spans=None, prefix_len=6, latent_shape=(2, 2, 2))
     impl = SimpleNamespace(
         rainfusion=SimpleNamespace(
@@ -104,16 +89,7 @@ def adapter(monkeypatch):
         _resolve_plan=lambda metadata: plan,
     )
 
-    def original_attention(q, k, v, metadata):
-        raise AssertionError("outer Ulysses must not run after the SDK pipeline is admitted")
-
-    attention = original_attention
-    attention.__dict__.update(
-        attn_backend=SimpleNamespace(
-            get_name=lambda: "RAINFUSION_ATTN",
-            supports_packed_mask_free=lambda: False,
-            supports_prefix_kv_slicing=True,
-        ),
+    attention = SimpleNamespace(
         causal=False,
         qkv_layout="BSND",
         _has_custom_attention=False,
@@ -122,14 +98,12 @@ def adapter(monkeypatch):
         paged_kv_cache_role=None,
         _get_active_parallel_strategy=lambda: strategy,
         _with_kv_cache_dtype=lambda metadata: metadata,
-        attention=impl,
     )
-    metadata = make_metadata(extra={}, video_layout=None)
     query = torch.zeros((1, 8, 4, 8), dtype=torch.bfloat16)
     return SimpleNamespace(
         module=module,
         attention=attention,
-        metadata=metadata,
+        metadata=AttentionMetadata(),
         query=query,
         calls=calls,
         states=states,
@@ -138,20 +112,14 @@ def adapter(monkeypatch):
         group=group,
         plan=plan,
         impl=impl,
-        library=library,
+        library=sys.modules["mindiesd.parallel"],
         platform=platform,
     )
 
 
-def run(adapter, **kwargs):
-    q = kwargs.get("query", adapter.query)
-    return adapter.module.try_distributed_sparse_attention(
-        kwargs.get("attention", adapter.attention),
-        q,
-        kwargs.get("key", q),
-        kwargs.get("value", q),
-        adapter.metadata,
-    )
+def run(adapter, *, query=None):
+    q = adapter.query if query is None else query
+    return adapter.module.try_distributed_sparse_attention(adapter.attention, q, q, q, adapter.metadata)
 
 
 def test_pipeline_call_is_explicit_and_state_is_reused(adapter):
@@ -279,14 +247,8 @@ def test_teardown_drains_before_releasing_state_and_is_idempotent(adapter, monke
 
 
 def test_rf_relabel_preserves_modalities_and_padding(adapter, monkeypatch):
-    abstract = ModuleType("vllm_omni.diffusion.attention.backends.abstract")
-    setattr(abstract, "AttentionMetadata", make_metadata)
-    monkeypatch.setitem(sys.modules, abstract.__name__, abstract)
     name = "vllm_omni.diffusion.models.minimax_h3.attention.rf_reorder_hoist"
-    spec = importlib.util.spec_from_file_location(name, MODEL_DIR / "attention/rf_reorder_hoist.py")
-    assert spec is not None and spec.loader is not None
-    helper = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(helper)
+    helper = load_module(monkeypatch, name, MODEL_DIR / "attention/rf_reorder_hoist.py")
     branch = SimpleNamespace(
         seq_len=10,
         device=torch.device("cpu"),

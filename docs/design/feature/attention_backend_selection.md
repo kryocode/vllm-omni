@@ -140,21 +140,11 @@ missing-kernel errors remain startup failures, not runtime fallbacks.
 Use a new backend for a new provider/capability contract. `custom_attention`
 instead owns communication and requires `skip_sequence_parallel=True`.
 
-MiniMax-H3's RainFusion adapter is admitted before shared parallel dispatch
-when MindIE-SD can own the complete distributed sparse call. It reuses the
-selected backend's sparse eligibility plan and the layer's effective attention
-precision; backend selection and configuration precedence remain unchanged.
-Admitted calls bypass Omni's Q/K/V exchange and reverse exchange, using the
-actual Ulysses process group and one caller-owned `ParallelState` per
-communicator/device shared across layers. Unsupported geometry or parallel
-modes retain shared dispatch before communication. Errors after admission
-propagate, because retrying through another collective sequence is unsafe.
-
-The SP coordinator owns executor resources and drains them before destroying
-its process groups. A complete MindIE executor is separate from Ulysses's
-`_exchange_qkv`, `_scatter_heads` and `_gather_heads` transport hooks. The
-model-local admission helper uses the effective scheduled backend and preserves
-native dispatch for declined calls. See the [MindIE guide](../../user_guide/diffusion/parallelism/mindiesd.md).
+MiniMax-H3's [MindIE-SD executor](../../user_guide/diffusion/parallelism/mindiesd.md)
+reuses the effective backend's sparse plan and Ulysses group, owning both A2A
+directions before shared dispatch. The SP coordinator owns its state and drains
+it before group teardown. Declined calls retain native dispatch; admitted
+execution errors propagate without collective retry.
 
 ## Adding or changing a backend
 
