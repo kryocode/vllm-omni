@@ -7,10 +7,9 @@ from dataclasses import replace
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.forward_context import get_ulysses_mode
 from vllm_omni.platforms import current_omni_platform
 
-from .mindiesd_parallel import _selected_config
+from .mindiesd_parallel import supports_mindiesd_ulysses
 
 
 def relabel_branch(branch, permutation: torch.Tensor, inverse: torch.Tensor) -> None:
@@ -49,7 +48,7 @@ def maybe_hoist_branch(branch, model) -> bool:
         return False
     records = [layer.effective_attention() for layer in layers]
     configs = [
-        _selected_config(impl) if backend.get_name() == "RAINFUSION_ATTN" else None for impl, backend, _ in records
+        impl.rainfusion.parallel if backend.get_name() == "RAINFUSION_ATTN" else None for impl, backend, _ in records
     ]
     if not any(config is not None and config.reorder_hoist for config in configs):
         return False
@@ -60,14 +59,11 @@ def maybe_hoist_branch(branch, model) -> bool:
     for layer, (impl, _, _) in zip(layers, records, strict=True):
         strategy = layer._get_active_parallel_strategy()
         if (
-            strategy.name != "ulysses"
-            or get_ulysses_mode(default="strict") != "strict"
-            or strategy._sp_group.ring_world_size != 1
-            or strategy._sp_group.allgather_world_size != 1
-            or strategy._ulysses_a2a_permute
+            not supports_mindiesd_ulysses(strategy)
             or layer._has_custom_attention
             or layer.is_paged_kv_active()
             or impl.rainfusion.precision != "bf16"
+            or impl.rainfusion.sparse_type != "rf_v3"
             or layer._with_kv_cache_dtype(AttentionMetadata()).extra.get("kv_cache_dtype", "bf16")
             not in ("float", "bf16")
             or getattr(layer, "_schedule_candidates", {})

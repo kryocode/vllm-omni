@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelResources
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.cpu]
 
@@ -31,11 +32,6 @@ def load_module(monkeypatch, name, path):
 
 @pytest.fixture
 def adapter(monkeypatch):
-    load_module(
-        monkeypatch,
-        "vllm_omni.diffusion.distributed.mindiesd_config",
-        ROOT / "vllm_omni/diffusion/distributed/mindiesd_config.py",
-    )
     calls, states = [], []
 
     def new_state(**kwargs):
@@ -61,13 +57,10 @@ def adapter(monkeypatch):
     monkeypatch.setattr(module.dist, "get_world_size", lambda group: 2)
 
     group = object()
-    resources_module = load_module(
-        monkeypatch, "h3_test_resources", ROOT / "vllm_omni/diffusion/distributed/resources.py"
-    )
     coordinator = SimpleNamespace(
         ring_world_size=1,
         allgather_world_size=1,
-        resources=resources_module.SequenceParallelResources(),
+        resources=SequenceParallelResources(),
     )
     strategy = SimpleNamespace(
         name="ulysses",
@@ -244,6 +237,30 @@ def test_teardown_drains_before_releasing_state_and_is_idempotent(adapter, monke
     assert drained == [state] and resource.state is None
     adapter.coordinator.resources.close()
     assert drained == [state]
+
+
+@pytest.mark.parametrize(
+    "target,name,value",
+    [
+        ("strategy", "_ulysses_pg", None),
+        ("strategy", "_scatter_idx", 1),
+        ("strategy", "_gather_idx", 2),
+        ("rainfusion", "sparse_type", "rf_v2"),
+    ],
+)
+def test_reorder_preflight_rejects_incompatible_executor(adapter, monkeypatch, target, name, value):
+    setattr(adapter.strategy if target == "strategy" else adapter.impl.rainfusion, name, value)
+    helper = load_module(
+        monkeypatch,
+        "vllm_omni.diffusion.models.minimax_h3.attention.rf_reorder_hoist",
+        MODEL_DIR / "attention/rf_reorder_hoist.py",
+    )
+    layout = SimpleNamespace(pre_rearranged=False)
+    branch = SimpleNamespace(static_kwargs={"video_token_layout": layout})
+    model = SimpleNamespace(blocks=[SimpleNamespace(attn=SimpleNamespace(attention=adapter.attention))])
+    with pytest.raises(ValueError, match="BF16 pure strict Ulysses"):
+        helper.maybe_hoist_branch(branch, model)
+    assert not layout.pre_rearranged and not adapter.calls and not adapter.states
 
 
 def test_rf_relabel_preserves_modalities_and_padding(adapter, monkeypatch):

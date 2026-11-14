@@ -15,7 +15,7 @@ import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.distributed.mindiesd_config import MindIEParallelConfig
+from vllm_omni.diffusion.data import MindIEParallelConfig
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
 from vllm_omni.platforms import current_omni_platform
 
@@ -60,7 +60,6 @@ class MindIEParallelResource:
         spans: list,
         *,
         used_len: int,
-        precision: str,
         scale: float,
         sparsity: float,
         pre_rearranged: bool,
@@ -82,7 +81,7 @@ class MindIEParallelResource:
                 state=self.state,
                 sparse_type="rf_v3",
                 used_len=used_len,
-                precision=precision,
+                precision="bf16",
                 scale=scale,
                 sparsity=sparsity,
                 pre_rearranged=pre_rearranged,
@@ -110,8 +109,18 @@ class MindIEParallelResource:
         gc.collect()
 
 
-def _selected_config(impl) -> MindIEParallelConfig | None:
-    return impl.rainfusion.parallel
+def supports_mindiesd_ulysses(strategy) -> bool:
+    """One topology contract for request reorder and per-layer SDK admission."""
+    return (
+        strategy.name == "ulysses"
+        and get_ulysses_mode(default="strict") == "strict"
+        and strategy._ulysses_pg is not None
+        and strategy._sp_group.ring_world_size == 1
+        and strategy._sp_group.allgather_world_size == 1
+        and strategy._scatter_idx == 2
+        and strategy._gather_idx == 1
+        and not strategy._ulysses_a2a_permute
+    )
 
 
 def try_distributed_sparse_attention(
@@ -125,7 +134,7 @@ def try_distributed_sparse_attention(
     impl, backend, _ = attention.effective_attention()
     if not current_omni_platform.is_npu() or backend.get_name() != "RAINFUSION_ATTN":
         return None
-    config = _selected_config(impl)
+    config = impl.rainfusion.parallel
     if config is None:
         return None
     if impl.rainfusion.precision != "bf16" or impl.rainfusion.sparse_type != "rf_v3":
@@ -161,20 +170,10 @@ def try_distributed_sparse_attention(
     ):
         return None
     strategy = attention._get_active_parallel_strategy()
-    if strategy.name != "ulysses" or get_ulysses_mode(default="strict") != "strict":
+    if not supports_mindiesd_ulysses(strategy) or not dist.is_initialized():
         return None
     coordinator = strategy._sp_group
     group = strategy._ulysses_pg
-    if (
-        group is None
-        or not dist.is_initialized()
-        or coordinator.ring_world_size != 1
-        or coordinator.allgather_world_size != 1
-        or strategy._scatter_idx != 2
-        or strategy._gather_idx != 1
-        or strategy._ulysses_a2a_permute
-    ):
-        return None
     world = dist.get_world_size(group)
     if world <= 1 or query.shape[2] % world:
         return None
@@ -185,15 +184,13 @@ def try_distributed_sparse_attention(
     precision = effective_metadata.extra.get("kv_cache_dtype", impl.rainfusion.precision)
     if precision not in ("float", "bf16"):
         return None
-    precision = "bf16"
     pre_rearranged = bool(getattr(metadata.video_layout, "pre_rearranged", False))
     spans = plan.video_spans or [{"start": plan.prefix_len, "latent_shape": list(plan.latent_shape)}]
     resource = coordinator.resources.get_or_create(
         ("mindiesd", group, query.device),
         lambda: MindIEParallelResource(group, query.device, config),
     )
-    fixed = ("overlap_comm",)
-    if any(getattr(resource.config, name) != getattr(config, name) for name in fixed):
+    if resource.config.overlap_comm != config.overlap_comm:
         raise RuntimeError("MindIE parallel configuration must agree across layers sharing a communicator/device")
     return resource.execute(
         query,
@@ -201,7 +198,6 @@ def try_distributed_sparse_attention(
         value,
         spans,
         used_len=plan.used_len,
-        precision=precision,
         scale=impl.softmax_scale,
         sparsity=impl.rainfusion.sparsity,
         pre_rearranged=pre_rearranged,

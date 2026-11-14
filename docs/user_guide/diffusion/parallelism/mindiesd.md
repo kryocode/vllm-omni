@@ -54,6 +54,11 @@ SDK mappings, chains, receive buffers, stream and events across layers/steps.
 Calls must be serialized and share the same overlap mode. Before group teardown,
 Omni synchronizes the device and releases state; the SDK has no public close API.
 
+Configuration lives beside `BlockSparseSpec` in `data.py`; executor resources
+live with their owner in `group_coordinator.py`. The two H3 attention helpers
+handle per-layer SDK execution and request-level reorder, sharing one Ulysses
+topology check. Additional SDK capabilities can extend these boundaries.
+
 ## Validation
 
 CPU contracts cover admission, configuration, state reuse/failure/teardown and

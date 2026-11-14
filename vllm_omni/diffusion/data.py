@@ -2254,6 +2254,19 @@ class RainFusionPrecision(str, Enum):
     MIX = "mix"
 
 
+@dataclass(frozen=True)
+class MindIEParallelConfig:
+    """Controls for the complete MindIE-SD executor and request-level RF reorder."""
+
+    overlap_comm: bool = True
+    reorder_hoist: bool = True
+
+    def __post_init__(self) -> None:
+        for name in ("overlap_comm", "reorder_hoist"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"MindIE parallel {name} must be a boolean and agree across ranks")
+
+
 @dataclass
 class BlockSparseSpec:
     """User-facing controls shared by block-sparse attention backends.
@@ -2278,8 +2291,6 @@ class BlockSparseSpec:
         if self.sparse_type not in ("rf_v2", "rf_v3"):
             raise ValueError("block_sparse.sparse_type must be rf_v2 or rf_v3")
         if self.parallel is not None:
-            from vllm_omni.diffusion.distributed.mindiesd_config import MindIEParallelConfig
-
             MindIEParallelConfig(**self.parallel)
         self.sparsity = _in_range(self.sparsity, "block_sparse.sparsity", 0.0, 1.0) or 0.0
         if self.start_step < 0:
