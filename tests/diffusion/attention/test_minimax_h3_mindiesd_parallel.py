@@ -5,13 +5,15 @@
 
 import importlib.util
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
+from vllm_omni.diffusion.attention.parallel.ulysses_allgather import UlyssesAllGatherKVParallelAttention
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelResources
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.cpu]
@@ -19,6 +21,42 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.paralle
 ROOT = Path(__file__).resolve().parents[3]
 MODEL_DIR = ROOT / "vllm_omni/diffusion/models/minimax_h3"
 HELPER_NAME = "vllm_omni.diffusion.models.minimax_h3.attention.mindiesd_parallel"
+
+
+@dataclass
+class HoistAttention:
+    attention: object
+
+
+@dataclass
+class HoistBlock:
+    attn: HoistAttention
+
+
+@dataclass
+class HoistModel:
+    blocks: list[HoistBlock]
+
+
+@dataclass
+class HoistBranch:
+    seq_len: int
+    used_len: int
+    device: torch.device
+    img_pos: torch.Tensor
+    audio_pos: torch.Tensor
+    text_pos_dev: torch.Tensor
+    token_tags_dev: torch.Tensor
+    img_position_ids_dev: torch.Tensor
+    static_kwargs: dict[str, object]
+    img_pos_dev: torch.Tensor = field(init=False)
+    audio_pos_dev: torch.Tensor = field(init=False)
+
+
+@dataclass
+class HoistPlan:
+    permutation: torch.Tensor
+    inverse: torch.Tensor
 
 
 def load_module(monkeypatch, name, path):
@@ -116,22 +154,23 @@ def run(adapter, *, query=None):
 
 
 def test_pipeline_call_is_explicit_and_state_is_reused(adapter):
-    torch.testing.assert_close(run(adapter), adapter.query + 1)
+    assert torch.equal(run(adapter), adapter.query + 1)
     run(adapter)
     assert len(adapter.states) == 1
     resource = adapter.coordinator.resources.get_or_create(
-        ("mindiesd", adapter.group, adapter.query.device), lambda: None
+        ("mindiesd", adapter.group, None, adapter.query.device, "rf_v3", "bf16", "eagle"), lambda: None
     )
     assert resource.completed_calls == 2
     state = adapter.states[0]
     assert state.overlap_comm is True
     assert state.optimize_attention_pipeline is True
-    assert state.bsa_backend == "cann"
+    assert state.bsa_backend == "eagle"
     q, k, v, spans, kwargs = adapter.calls[0]
     assert q is k is v is adapter.query
     assert spans == [{"start": 6, "latent_shape": [2, 2, 2]}]
     assert kwargs == dict(
         group=adapter.group,
+        cp_group=None,
         used_len=14,
         state=state,
         precision="bf16",
@@ -146,6 +185,196 @@ def test_pre_rearranged_is_forwarded(adapter):
     adapter.metadata.video_layout = SimpleNamespace(pre_rearranged=True)
     run(adapter)
     assert adapter.calls[0][-1]["pre_rearranged"] is True
+
+
+@pytest.mark.parametrize(
+    "sparse_type,precision,backend,dtype",
+    [
+        ("rf_v2", "bf16", "cann", torch.bfloat16),
+        ("rf_v2", "fp16", "cann", torch.float16),
+        ("rf_v3", "bf16", "eagle", torch.bfloat16),
+        ("rf_v3", "fp16", "eagle", torch.float16),
+        ("rf_v3", "mix", "eagle", torch.bfloat16),
+        ("rf_v3", "mxfp8", "cann", torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("pre_rearranged", [False, True])
+def test_all_four_sparse_paths_reach_the_public_sdk(adapter, sparse_type, precision, backend, dtype, pre_rearranged):
+    adapter.impl.rainfusion.sparse_type = sparse_type
+    adapter.impl.rainfusion.precision = precision
+    adapter.impl.rainfusion.bsa_backend = backend
+    adapter.metadata.video_layout = VideoTokenLayout(pre_rearranged=pre_rearranged)
+    q = torch.zeros((1, 8, 4, 128), dtype=dtype)
+    assert torch.equal(run(adapter, query=q), q + 1)
+    assert adapter.calls[0][-1]["precision"] == precision
+    assert adapter.calls[0][-1]["sparse_type"] == sparse_type
+    assert adapter.calls[0][-1]["pre_rearranged"] is pre_rearranged
+    assert adapter.states[0].bsa_backend == backend
+
+
+@pytest.mark.parametrize(
+    "sparse_type,precision,backend",
+    [
+        ("rf_v2", "bf16", "cann"),
+        ("rf_v2", "fp16", "cann"),
+        ("rf_v3", "bf16", "eagle"),
+        ("rf_v3", "fp16", "eagle"),
+        ("rf_v3", "mix", "eagle"),
+        ("rf_v3", "mxfp8", "cann"),
+    ],
+)
+@pytest.mark.parametrize("ulysses_size", [4, 8])
+def test_cp_uses_the_existing_orthogonal_group_and_exact_sdk_keywords(
+    adapter, sparse_type, precision, backend, ulysses_size
+):
+    adapter.impl.rainfusion.sparse_type = sparse_type
+    adapter.impl.rainfusion.precision = precision
+    adapter.impl.rainfusion.bsa_backend = backend
+    adapter.metadata.video_layout = VideoTokenLayout(pre_rearranged=True)
+    adapter.coordinator.allgather_world_size = 2
+    adapter.coordinator.allgather_group = object()
+    adapter.coordinator.ulysses_world_size = ulysses_size
+    adapter.coordinator.ulysses_group = adapter.group
+    combined = object.__new__(UlyssesAllGatherKVParallelAttention)
+    combined._sp_group = adapter.coordinator
+    combined._ulysses = adapter.strategy
+    adapter.strategy = combined
+    adapter.attention._get_active_parallel_strategy = lambda: adapter.strategy
+    adapter.module.dist.get_world_size = (
+        lambda group=None: ulysses_size * 2
+        if group is None
+        else (2 if group is adapter.coordinator.allgather_group else ulysses_size)
+    )
+    adapter.plan.used_len = 251
+    adapter.plan.video_spans = [{"start": 123, "latent_shape": [2, 8, 8]}]
+    dtype = torch.float16 if precision == "fp16" else torch.bfloat16
+    q = torch.zeros((1, 32, 56, 128), dtype=dtype)
+    assert torch.equal(run(adapter, query=q), q + 1)
+    kwargs = adapter.calls[0][-1]
+    assert kwargs["group"] is adapter.group
+    assert kwargs["cp_group"] is adapter.coordinator.allgather_group
+    assert adapter.states[0].cp_group is adapter.coordinator.allgather_group
+    assert not {"kv_gather_group", "comm_dtype", "comm_quant_scope"}.intersection(kwargs)
+
+
+def test_resource_caches_do_not_mix_precision_or_backend(adapter):
+    adapter.impl.rainfusion.bsa_backend = "eagle"
+    run(adapter)
+    adapter.impl.rainfusion.sparse_type = "rf_v2"
+    adapter.impl.rainfusion.bsa_backend = "cann"
+    run(adapter)
+    assert len(adapter.states) == 2
+
+
+def test_explicit_fp16_attention_restores_the_bf16_producer_dtype(adapter):
+    adapter.impl.rainfusion.precision = "fp16"
+    adapter.impl.rainfusion.bsa_backend = "eagle"
+    output = run(adapter)
+    assert output.dtype == torch.bfloat16
+    assert all(value.dtype == torch.float16 for value in adapter.calls[0][:3])
+
+
+def test_pipeline_optimization_switches_are_passed_without_overriding(adapter):
+    adapter.impl.rainfusion.parallel = adapter.module.MindIEParallelConfig(
+        overlap_comm=False,
+        reorder_hoist=False,
+        optimize_attention_pipeline=False,
+        chunk_ready_pipeline=False,
+    )
+    run(adapter)
+    state = adapter.states[0]
+    assert state.overlap_comm is state.optimize_attention_pipeline is state.chunk_ready_pipeline is False
+
+
+@pytest.mark.parametrize(
+    "sparse_type,precision,backend",
+    [
+        ("rf_v2", "bf16", "cann"),
+        ("rf_v2", "fp16", "cann"),
+        ("rf_v3", "bf16", "eagle"),
+        ("rf_v3", "fp16", "eagle"),
+        ("rf_v3", "mix", "eagle"),
+        ("rf_v3", "mxfp8", "cann"),
+    ],
+)
+def test_native_comparison_selects_the_same_sparse_provider(monkeypatch, sparse_type, precision, backend):
+    from vllm_omni.diffusion.attention.backends import rainfusion_attn
+
+    calls = []
+
+    def sparse_attention(q, k, v, *, precision, video_spans, **kwargs):
+        calls.append((q, k, v, precision, video_spans, kwargs))
+        return q
+
+    library = ModuleType("mindiesd")
+    setattr(library, "sparse_attention", sparse_attention)
+    monkeypatch.setitem(sys.modules, "mindiesd", library)
+    monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
+    impl = rainfusion_attn.RainFusionAttentionImpl(
+        num_heads=4,
+        head_size=128,
+        softmax_scale=128**-0.5,
+        qkv_layout="BSND",
+        backend_kwargs={"sparsity": 0.8, "sparse_type": sparse_type, "precision": precision, "bsa_backend": backend},
+    )
+    q = torch.arange(32 * 4 * 128).reshape(1, 32, 4, 128).to(torch.bfloat16)
+    spans = [{"start": 0, "latent_shape": [2, 2, 3]}]
+    output = impl._forward_sparse_npu(q, q, q, rainfusion_attn.RainFusionPlan(used_len=12, video_spans=spans))
+    assert torch.equal(output, q) and output.dtype == q.dtype
+    operands = calls[0][:3]
+    assert all(t.shape[1] == 12 for t in operands)
+    assert all(t.dtype == (torch.float16 if precision == "fp16" else q.dtype) for t in operands)
+    assert calls[0][3] == ("bf16" if precision == "fp16" else precision)
+    assert calls[0][-1]["sparse_type"] == sparse_type
+    if sparse_type == "rf_v3":
+        assert calls[0][-1]["bsa_backend"] == backend
+
+
+@pytest.mark.parametrize(
+    "sparse_type,precision,backend",
+    [
+        ("rf_v2", "bf16", "cann"),
+        ("rf_v2", "fp16", "cann"),
+        ("rf_v3", "bf16", "eagle"),
+        ("rf_v3", "fp16", "eagle"),
+        ("rf_v3", "mix", "eagle"),
+        ("rf_v3", "mxfp8", "cann"),
+    ],
+)
+def test_all_four_paths_can_hoist_the_same_public_rf_plan(adapter, monkeypatch, sparse_type, precision, backend):
+    adapter.impl.rainfusion.sparse_type = sparse_type
+    adapter.impl.rainfusion.precision = precision
+    adapter.impl.rainfusion.bsa_backend = backend
+    helper = load_module(
+        monkeypatch,
+        "vllm_omni.diffusion.models.minimax_h3.attention.rf_reorder_hoist",
+        MODEL_DIR / "attention/rf_reorder_hoist.py",
+    )
+    plan = torch.tensor([0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 6, 7, 8, 9])
+    root = ModuleType("mindiesd")
+    setattr(root, "build_rf_attention_plan", lambda **kwargs: HoistPlan(plan, torch.argsort(plan)))
+    monkeypatch.setitem(sys.modules, "mindiesd", root)
+    branch = HoistBranch(
+        seq_len=16,
+        used_len=14,
+        device=torch.device("cpu"),
+        img_pos=torch.arange(6, 14),
+        audio_pos=torch.tensor([4, 5]),
+        text_pos_dev=torch.arange(4),
+        token_tags_dev=torch.arange(16),
+        img_position_ids_dev=torch.arange(48).reshape(16, 3),
+        static_kwargs={
+            "video_token_layout": VideoTokenLayout(prefix_len=6, latent_grid=(2, 2, 2)),
+            "packed_seq_params": {"vsa_prefix_segments": ()},
+        },
+    )
+    model = HoistModel([HoistBlock(HoistAttention(adapter.attention))])
+    assert helper.maybe_hoist_branch(branch, model)
+    layout = branch.static_kwargs["video_token_layout"]
+    packed = branch.static_kwargs["packed_seq_params"]
+    assert isinstance(layout, VideoTokenLayout) and layout.pre_rearranged
+    assert isinstance(packed, dict) and "vsa_prefix_segments" not in packed
+    assert torch.cat((plan, torch.tensor([14, 15]))).index_select(0, branch.img_pos_dev).tolist() == list(range(6, 14))
 
 
 def test_live_resource_rejects_overlap_mode_change(adapter):
@@ -200,11 +429,11 @@ def test_unsupported_tensor_contract_declines(adapter, shape, dtype):
     assert not adapter.calls
 
 
-@pytest.mark.parametrize("precision,sparse_type", [("mix", "rf_v3"), ("bf16", "rf_v2")])
+@pytest.mark.parametrize("precision,sparse_type", [("mix", "rf_v2"), ("fp8", "rf_v3"), ("mxfp4", "rf_v3")])
 def test_enabled_pipeline_rejects_non_target_attention_mode(adapter, precision, sparse_type):
     adapter.impl.rainfusion.precision = precision
     adapter.impl.rainfusion.sparse_type = sparse_type
-    with pytest.raises(ValueError, match="precision='bf16'.*sparse_type='rf_v3'"):
+    with pytest.raises(ValueError, match="Unsupported MindIE parallel"):
         run(adapter)
     assert not adapter.calls and not adapter.states
 
@@ -226,7 +455,7 @@ def test_teardown_drains_before_releasing_state_and_is_idempotent(adapter, monke
 
     run(adapter)
     resource = adapter.coordinator.resources.get_or_create(
-        ("mindiesd", adapter.group, adapter.query.device), lambda: None
+        ("mindiesd", adapter.group, None, adapter.query.device, "rf_v3", "bf16", "eagle"), lambda: None
     )
     state, drained = resource.state, []
     monkeypatch.setattr(
@@ -245,7 +474,7 @@ def test_teardown_drains_before_releasing_state_and_is_idempotent(adapter, monke
         ("strategy", "_ulysses_pg", None),
         ("strategy", "_scatter_idx", 1),
         ("strategy", "_gather_idx", 2),
-        ("rainfusion", "sparse_type", "rf_v2"),
+        ("rainfusion", "sparse_type", "ada_bsa"),
     ],
 )
 def test_reorder_preflight_rejects_incompatible_executor(adapter, monkeypatch, target, name, value):
@@ -258,7 +487,7 @@ def test_reorder_preflight_rejects_incompatible_executor(adapter, monkeypatch, t
     layout = SimpleNamespace(pre_rearranged=False)
     branch = SimpleNamespace(static_kwargs={"video_token_layout": layout})
     model = SimpleNamespace(blocks=[SimpleNamespace(attn=SimpleNamespace(attention=adapter.attention))])
-    with pytest.raises(ValueError, match="BF16 pure strict Ulysses"):
+    with pytest.raises(ValueError, match="MindIE|strict Ulysses"):
         helper.maybe_hoist_branch(branch, model)
     assert not layout.pre_rearranged and not adapter.calls and not adapter.states
 

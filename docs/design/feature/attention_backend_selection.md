@@ -142,9 +142,14 @@ instead owns communication and requires `skip_sequence_parallel=True`.
 
 MiniMax-H3's [MindIE-SD executor](../../user_guide/diffusion/parallelism/mindiesd.md)
 reuses the effective backend's sparse plan and Ulysses group, owning both A2A
-directions before shared dispatch. The SP coordinator owns its state and drains
-it before group teardown. Declined calls retain native dispatch; admitted
-execution errors propagate without collective retry.
+directions before shared dispatch. CP x Ulysses also reuses the coordinator's
+orthogonal AllGather-KV group as the SDK's `cp_group` and requires RF-reordered
+input. The four supported algorithm/precision/provider paths are specified in
+the guide; invalid combinations fail before SDK resource allocation. The SP
+coordinator owns state per Ulysses group, CP group, device, algorithm, precision
+and provider and drains it before group teardown. Declined original-order calls
+retain native dispatch; admitted execution errors propagate without collective
+retry.
 
 ## Adding or changing a backend
 

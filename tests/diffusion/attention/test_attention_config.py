@@ -63,6 +63,53 @@ def _clear_inherited_attention_backend(monkeypatch):
 
 
 class TestAttentionSpec:
+    @pytest.mark.parametrize(
+        "sparse_type,precision,backend",
+        [
+            ("rf_v2", "bf16", "cann"),
+            ("rf_v2", "fp16", "cann"),
+            ("rf_v3", "bf16", "eagle"),
+            ("rf_v3", "fp16", "eagle"),
+            ("rf_v3", "mix", "eagle"),
+            ("rf_v3", "mxfp8", "cann"),
+        ],
+    )
+    def test_mindie_parallel_four_path_config_round_trip(self, sparse_type, precision, backend):
+        config = AttentionSpec(
+            backend="RAINFUSION_ATTN",
+            block_sparse={
+                "sparse_type": sparse_type,
+                "precision": precision,
+                "bsa_backend": backend,
+                "parallel": {"optimize_attention_pipeline": True, "chunk_ready_pipeline": True},
+            },
+        ).backend_kwargs()
+        assert config["precision"] == precision
+        assert config["bsa_backend"] == backend
+        assert config["parallel"] == {"optimize_attention_pipeline": True, "chunk_ready_pipeline": True}
+
+    @pytest.mark.parametrize(
+        "sparse_type,precision,backend",
+        [
+            ("rf_v2", "mix", "eagle"),
+            ("rf_v2", "mxfp8", "cann"),
+            ("rf_v3", "mxfp8", "eagle"),
+            ("rf_v3", "bf16", "cann"),
+            ("rf_v3", "fp8", "eagle"),
+        ],
+    )
+    def test_mindie_parallel_rejects_routes_outside_the_four_path_contract(self, sparse_type, precision, backend):
+        with pytest.raises(ValueError):
+            AttentionSpec(
+                backend="RAINFUSION_ATTN",
+                block_sparse={
+                    "sparse_type": sparse_type,
+                    "precision": precision,
+                    "bsa_backend": backend,
+                    "parallel": {},
+                },
+            )
+
     def test_construct_no_skip_softmax(self):
         spec = AttentionSpec(backend="FLASH_ATTN")
         assert spec.skip_softmax is None
