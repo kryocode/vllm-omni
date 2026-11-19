@@ -6,6 +6,7 @@
 import importlib.util
 import sys
 from dataclasses import dataclass, field
+from itertools import product
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -286,6 +287,99 @@ def test_pipeline_optimization_switches_are_passed_without_overriding(adapter):
     assert state.overlap_comm is state.optimize_attention_pipeline is state.chunk_ready_pipeline is False
 
 
+FIRST_TWO_PATHS = [
+    ("rf_v2", "bf16", "cann"),
+    ("rf_v2", "fp16", "cann"),
+    ("rf_v3", "bf16", "eagle"),
+    ("rf_v3", "fp16", "eagle"),
+]
+CONTROL_COMBINATIONS = list(product((False, True), repeat=4))
+
+
+@pytest.mark.parametrize("sparse_type,precision,backend", FIRST_TWO_PATHS)
+@pytest.mark.parametrize("overlap,hoist,optimize,ready", CONTROL_COMBINATIONS)
+@pytest.mark.parametrize("cp_size,pre_rearranged", [(1, False), (1, True), (2, True)])
+def test_first_two_paths_cover_every_control_and_input_combination(
+    adapter, sparse_type, precision, backend, overlap, hoist, optimize, ready, cp_size, pre_rearranged
+):
+    adapter.impl.rainfusion.sparse_type = sparse_type
+    adapter.impl.rainfusion.precision = precision
+    adapter.impl.rainfusion.bsa_backend = backend
+    adapter.impl.rainfusion.parallel = adapter.module.MindIEParallelConfig(
+        overlap_comm=overlap,
+        reorder_hoist=hoist,
+        optimize_attention_pipeline=optimize,
+        chunk_ready_pipeline=ready,
+    )
+    adapter.metadata.video_layout = VideoTokenLayout(pre_rearranged=pre_rearranged)
+    adapter.plan.used_len = 60 if cp_size == 1 else 251
+    adapter.plan.video_spans = (
+        [{"start": 28, "latent_shape": [2, 4, 4]}] if cp_size == 1 else [{"start": 123, "latent_shape": [2, 8, 8]}]
+    )
+    if cp_size == 2:
+        adapter.coordinator.allgather_world_size = 2
+        adapter.coordinator.allgather_group = object()
+        adapter.coordinator.ulysses_world_size = 4
+        adapter.coordinator.ulysses_group = adapter.group
+        strategy = object.__new__(UlyssesAllGatherKVParallelAttention)
+        strategy._sp_group = adapter.coordinator
+        strategy._ulysses = adapter.strategy
+        adapter.attention._get_active_parallel_strategy = lambda: strategy
+        adapter.module.dist.get_world_size = (
+            lambda group=None: 8 if group is None else (2 if group is adapter.coordinator.allgather_group else 4)
+        )
+    q = torch.arange(32 * 56 * 128).reshape(1, 32, 56, 128).remainder(17).to(torch.bfloat16)
+    output = run(adapter, query=q)
+    assert output.dtype == q.dtype and torch.equal(output, q + 1)
+    state = adapter.states[0]
+    assert (state.overlap_comm, state.optimize_attention_pipeline, state.chunk_ready_pipeline) == (
+        overlap,
+        optimize,
+        ready,
+    )
+    kwargs = adapter.calls[0][-1]
+    assert kwargs["precision"] == precision and kwargs["sparse_type"] == sparse_type
+    assert kwargs["pre_rearranged"] is pre_rearranged
+    assert kwargs["cp_group"] is (adapter.coordinator.allgather_group if cp_size == 2 else None)
+    assert all(
+        value.dtype == (torch.float16 if precision == "fp16" else torch.bfloat16) for value in adapter.calls[0][:3]
+    )
+
+
+@pytest.mark.parametrize("sparse_type,precision,backend", FIRST_TWO_PATHS)
+@pytest.mark.parametrize("overlap,hoist,optimize,ready", CONTROL_COMBINATIONS)
+def test_first_two_cp_paths_reject_original_order_before_sdk_allocation(
+    adapter, sparse_type, precision, backend, overlap, hoist, optimize, ready
+):
+    adapter.impl.rainfusion.sparse_type = sparse_type
+    adapter.impl.rainfusion.precision = precision
+    adapter.impl.rainfusion.bsa_backend = backend
+    adapter.impl.rainfusion.parallel = adapter.module.MindIEParallelConfig(
+        overlap_comm=overlap,
+        reorder_hoist=hoist,
+        optimize_attention_pipeline=optimize,
+        chunk_ready_pipeline=ready,
+    )
+    adapter.metadata.video_layout = VideoTokenLayout(pre_rearranged=False)
+    adapter.coordinator.allgather_world_size = 2
+    adapter.coordinator.allgather_group = object()
+    adapter.coordinator.ulysses_world_size = 4
+    adapter.coordinator.ulysses_group = adapter.group
+    strategy = object.__new__(UlyssesAllGatherKVParallelAttention)
+    strategy._sp_group = adapter.coordinator
+    strategy._ulysses = adapter.strategy
+    adapter.attention._get_active_parallel_strategy = lambda: strategy
+    adapter.plan.used_len = 251
+    adapter.plan.video_spans = [{"start": 123, "latent_shape": [2, 8, 8]}]
+    adapter.module.dist.get_world_size = (
+        lambda group=None: 8 if group is None else (2 if group is adapter.coordinator.allgather_group else 4)
+    )
+    q = torch.zeros((1, 32, 56, 128), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="pre_rearranged=True"):
+        run(adapter, query=q)
+    assert not adapter.calls and not adapter.states
+
+
 @pytest.mark.parametrize(
     "sparse_type,precision,backend",
     [
@@ -375,6 +469,64 @@ def test_all_four_paths_can_hoist_the_same_public_rf_plan(adapter, monkeypatch, 
     assert isinstance(layout, VideoTokenLayout) and layout.pre_rearranged
     assert isinstance(packed, dict) and "vsa_prefix_segments" not in packed
     assert torch.cat((plan, torch.tensor([14, 15]))).index_select(0, branch.img_pos_dev).tolist() == list(range(6, 14))
+
+
+@pytest.mark.parametrize("sparse_type,precision,backend", FIRST_TWO_PATHS)
+@pytest.mark.parametrize("overlap,hoist,optimize,ready", CONTROL_COMBINATIONS)
+@pytest.mark.parametrize("already_rearranged", [False, True])
+def test_first_two_hoist_control_matrix_preserves_all_packed_positions(
+    adapter, monkeypatch, sparse_type, precision, backend, overlap, hoist, optimize, ready, already_rearranged
+):
+    adapter.impl.rainfusion.sparse_type = sparse_type
+    adapter.impl.rainfusion.precision = precision
+    adapter.impl.rainfusion.bsa_backend = backend
+    adapter.impl.rainfusion.parallel = adapter.module.MindIEParallelConfig(
+        overlap_comm=overlap,
+        reorder_hoist=hoist,
+        optimize_attention_pipeline=optimize,
+        chunk_ready_pipeline=ready,
+    )
+    helper = load_module(
+        monkeypatch,
+        "vllm_omni.diffusion.models.minimax_h3.attention.rf_reorder_hoist",
+        MODEL_DIR / "attention/rf_reorder_hoist.py",
+    )
+    permutation = torch.tensor([0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 6, 7, 8, 9])
+    calls = []
+    root = ModuleType("mindiesd")
+
+    def plan_builder(**kwargs):
+        calls.append(kwargs)
+        return HoistPlan(permutation, torch.argsort(permutation))
+
+    setattr(root, "build_rf_attention_plan", plan_builder)
+    monkeypatch.setitem(sys.modules, "mindiesd", root)
+    branch = HoistBranch(
+        seq_len=16,
+        used_len=14,
+        device=torch.device("cpu"),
+        img_pos=torch.arange(6, 14),
+        audio_pos=torch.tensor([4, 5]),
+        text_pos_dev=torch.arange(4),
+        token_tags_dev=torch.arange(16),
+        img_position_ids_dev=torch.arange(48).reshape(16, 3),
+        static_kwargs={
+            "video_token_layout": VideoTokenLayout(
+                prefix_len=6, latent_grid=(2, 2, 2), pre_rearranged=already_rearranged
+            ),
+            "packed_seq_params": {"vsa_prefix_segments": ()},
+        },
+    )
+    model = HoistModel([HoistBlock(HoistAttention(adapter.attention))])
+    changed = helper.maybe_hoist_branch(branch, model)
+    assert changed is (hoist or already_rearranged)
+    assert bool(calls) is (hoist and not already_rearranged)
+    assert branch.static_kwargs["video_token_layout"].pre_rearranged is (hoist or already_rearranged)
+    extended = torch.cat((permutation, torch.tensor([14, 15]))) if calls else torch.arange(16)
+    assert torch.equal(branch.token_tags_dev, extended)
+    assert torch.equal(branch.img_position_ids_dev, torch.arange(48).reshape(16, 3).index_select(0, extended))
+    assert sorted(branch.img_pos.tolist()) == list(range(6, 14))
+    assert branch.audio_pos.tolist() == [4, 5] and branch.text_pos_dev.tolist() == [0, 1, 2, 3]
 
 
 def test_live_resource_rejects_overlap_mode_change(adapter):
