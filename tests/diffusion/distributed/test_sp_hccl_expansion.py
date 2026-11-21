@@ -28,7 +28,11 @@ def load_group_builders(monkeypatch, mode, *, npu=True, entry="_set_ulysses_allg
             self.hccl_config = {}
 
     extension = ModuleType("torch_npu")
-    extension._C = SimpleNamespace(_distributed_c10d=SimpleNamespace(ProcessGroupHCCL=SimpleNamespace(Options=Options)))
+    setattr(
+        extension,
+        "_C",
+        SimpleNamespace(_distributed_c10d=SimpleNamespace(ProcessGroupHCCL=SimpleNamespace(Options=Options))),
+    )
     monkeypatch.setitem(sys.modules, "torch_npu", extension)
     tree = ast.parse(SOURCE.read_text())
     names = {"build_ulysses_allgather_rank_groups", "_set_ulysses_allgather_pg", "set_seq_parallel_pg"}
