@@ -124,25 +124,54 @@ def test_admission_failure_keeps_original_model_storage(monkeypatch, case, reaso
         assert target.data_ptr() == pointer and torch.equal(raw(target), expected)
 
 
-def test_second_allocation_failure_rolls_back_without_changing_values(monkeypatch):
+@pytest.mark.parametrize("first_contiguous", [False, True])
+def test_second_allocation_failure_rolls_back_without_changing_values(monkeypatch, first_contiguous):
     block = Block()
+    if first_contiguous:
+        block.adaLN_modulation.weight = nn.Parameter(block.adaLN_modulation.weight.contiguous(), requires_grad=False)
     originals = [(t, t.data_ptr(), raw(t).clone()) for _, t in adaln_cache.select_adaln_tensors([block])]
-    original = torch.empty_strided
+    original_empty = torch.empty_strided
+    original_to = torch.Tensor.to
     calls = 0
 
-    def fail_second(*args, **kwargs):
+    def fail_second(operation, *args, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 2:
             raise torch.OutOfMemoryError("injected allocation failure")
-        return original(*args, **kwargs)
+        return operation(*args, **kwargs)
 
-    monkeypatch.setattr(torch, "empty_strided", fail_second)
+    def injected_empty(*args, **kwargs):
+        return fail_second(original_empty, *args, **kwargs)
+
+    def injected_to(tensor, *args, **kwargs):
+        if kwargs.get("copy"):
+            return fail_second(original_to, tensor, *args, **kwargs)
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty_strided", injected_empty)
+    monkeypatch.setattr(torch.Tensor, "to", injected_to)
     cache = adaln_cache.AdaLNWeightCache(torch.device("cpu"))
     assert not cache.prepare([block], max_gib=1, reserve_gib=1)
     assert cache.status.reason == "cache_allocation_or_copy_failed"
     for target, pointer, expected in originals:
         assert target.data_ptr() == pointer and torch.equal(raw(target), expected)
+
+
+def test_contiguous_singleton_layout_preserves_noncanonical_stride():
+    module = nn.Module()
+    module.adaln = nn.Module()
+    value = torch.arange(2.0).as_strided((2, 1), (1, 100))
+    module.adaln.weight = nn.Parameter(value, requires_grad=False)
+    original = module.adaln.weight.detach()
+    assert original.is_contiguous()
+    cache = adaln_cache.AdaLNWeightCache(torch.device("cpu"))
+    cache.prepare([module], max_gib=1, reserve_gib=1)
+    assert cache.status.enabled
+    assert module.adaln.weight.stride() == original.stride()
+    assert torch.equal(raw(module.adaln.weight), raw(original))
+    cache.restore()
+    assert module.adaln.weight.data_ptr() == original.data_ptr()
 
 
 @pytest.mark.parametrize("after_commit", [False, True])

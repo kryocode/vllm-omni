@@ -94,8 +94,13 @@ class AdaLNWeightCache:
         try:
             for _, target in tensors:
                 original = target.detach()
-                fresh = torch.empty_strided(target.shape, target.stride(), dtype=target.dtype, device=self.device)
-                fresh.copy_(original)
+                # Prefer the platform's device-copy allocation for dense weights.
+                # Preserve explicit strides when that copy normalizes a layout.
+                fresh = original.to(device=self.device, copy=True) if original.is_contiguous() else None
+                if fresh is None or fresh.stride() != target.stride():
+                    fresh = None
+                    fresh = torch.empty_strided(target.shape, target.stride(), dtype=target.dtype, device=self.device)
+                    fresh.copy_(original)
                 prepared.append((target, original, fresh))
             current_omni_platform.synchronize()
             if int(current_omni_platform.get_free_memory(self.device)) < reserve:
