@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from itertools import chain
 from typing import Any
 
@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
+from .adaln_cache import AdaLNCacheStatus, AdaLNWeightCache
 from .base import OffloadBackend, OffloadConfig, run_cleanup_steps
 from .component_utils import (
     clear_encoder_layerwise_state,
@@ -21,7 +22,7 @@ from .component_utils import (
     prepare_pipeline_components,
     set_encoder_layerwise_state,
 )
-from .plan_resolver import ResolvedComponent, resolve_offload_plan
+from .plan_resolver import BlockStack, ResolvedComponent, resolve_offload_plan
 from .tensor_utils import (
     clear_block_storage,
     clear_tensor_storage,
@@ -30,7 +31,6 @@ from .tensor_utils import (
     group_named_tensors_by_dtype,
     is_materialized_tensor,
     materialization_probe,
-    module_materialization_probe,
     restore_tensor_storage,
     set_tensor_storage,
     tensor_storage_metadata,
@@ -62,6 +62,7 @@ class LayerwiseOffloadHook(ModelHook):
         stream: current_omni_platform.Stream | None = None,
         pin_memory: bool = True,
         materialization_probe_tensor: torch.Tensor | None = None,
+        resident_tensor_ids: frozenset[int] | None = None,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
 
@@ -69,6 +70,9 @@ class LayerwiseOffloadHook(ModelHook):
         self.device = device
         self.copy_stream = stream or current_omni_platform.current_stream()
         self.pin_memory = pin_memory
+        # Caller-owned static weights already placed on device are never
+        # included in host masters or storage mutations by this offloader.
+        self.resident_tensor_ids = resident_tensor_ids or frozenset()
 
         # Per-block synchronization primitive: set after H2D copy completes.
         self._prefetch_done: current_omni_platform.Event | None = None
@@ -87,13 +91,25 @@ class LayerwiseOffloadHook(ModelHook):
         # the input module is kept intact
         module = super().initialize_hook(module)
 
-        self.block_parameters: dict[str, nn.Parameter] = dict(module.named_parameters())
-        self.block_buffers: dict[str, torch.Tensor] = dict(module.named_buffers())
-        if self._materialization_probe is None:
+        self.block_parameters: dict[str, nn.Parameter] = {
+            name: tensor for name, tensor in module.named_parameters() if id(tensor) not in self.resident_tensor_ids
+        }
+        self.block_buffers: dict[str, torch.Tensor] = {
+            name: tensor for name, tensor in module.named_buffers() if id(tensor) not in self.resident_tensor_ids
+        }
+        if self._materialization_probe is None or id(self._materialization_probe) in self.resident_tensor_ids:
             self._materialization_probe = materialization_probe(self.block_parameters, self.block_buffers)
 
-        self.next_block_parameters: dict[str, nn.Parameter] = dict(self.next_block.named_parameters())
-        self.next_block_buffers: dict[str, torch.Tensor] = dict(self.next_block.named_buffers())
+        self.next_block_parameters: dict[str, nn.Parameter] = {
+            name: tensor
+            for name, tensor in self.next_block.named_parameters()
+            if id(tensor) not in self.resident_tensor_ids
+        }
+        self.next_block_buffers: dict[str, torch.Tensor] = {
+            name: tensor
+            for name, tensor in self.next_block.named_buffers()
+            if id(tensor) not in self.resident_tensor_ids
+        }
 
         # Pre-allocate gpu tensors in a flattened way
         self.dtype_cpu_flattened_weights, self.dtype_metadata = LayerwiseOffloadHook._to_cpu(
@@ -250,6 +266,7 @@ def apply_block_hook(
     pin_memory: bool = True,
     *,
     materialization_probe_tensor: torch.Tensor | None = None,
+    resident_tensor_ids: frozenset[int] | None = None,
 ) -> LayerwiseOffloadHook:
     registry = HookRegistry.get_or_create(module)
     hook = LayerwiseOffloadHook(
@@ -258,6 +275,7 @@ def apply_block_hook(
         stream,
         pin_memory,
         materialization_probe_tensor,
+        resident_tensor_ids=resident_tensor_ids,
     )
     registry.register_hook(LayerwiseOffloadHook._HOOK_NAME, hook)
 
@@ -276,6 +294,8 @@ def _install_layerwise_hook_group(
     device: torch.device,
     stream: Any,
     pin_memory: bool,
+    *,
+    resident_tensor_ids: frozenset[int] | None = None,
 ) -> list[LayerwiseOffloadHook]:
     """Install one circular hook ring and roll it back transactionally."""
     block_list = list(blocks)
@@ -284,7 +304,16 @@ def _install_layerwise_hook_group(
 
     hooks: list[LayerwiseOffloadHook] = []
     hooked_blocks: list[nn.Module] = []
-    probes = {id(block): module_materialization_probe(block) for block in block_list}
+    resident_tensor_ids = resident_tensor_ids or frozenset()
+    # Capture filtered probes before any hook can clear the next block. A
+    # resident probe would hide an offloaded block from synchronous recovery.
+    probes = {
+        id(block): materialization_probe(
+            {name: tensor for name, tensor in block.named_parameters() if id(tensor) not in resident_tensor_ids},
+            {name: tensor for name, tensor in block.named_buffers() if id(tensor) not in resident_tensor_ids},
+        )
+        for block in block_list
+    }
     try:
         for block, next_block in zip(
             chain((block_list[-1],), block_list[:-1]),
@@ -299,6 +328,7 @@ def _install_layerwise_hook_group(
                     stream,
                     pin_memory,
                     materialization_probe_tensor=probes[id(block)],
+                    resident_tensor_ids=resident_tensor_ids,
                 )
             )
             hooked_blocks.append(block)
@@ -401,15 +431,27 @@ class LayerWiseOffloadBackend(OffloadBackend):
     previous blocks compute, and freed after use.
     """
 
-    def __init__(self, config: OffloadConfig, device: torch.device):
+    def __init__(
+        self,
+        config: OffloadConfig,
+        device: torch.device,
+        resident_tensor_ids: frozenset[int] | None = None,
+    ):
         super().__init__(config, device)
 
+        self.resident_tensor_ids = resident_tensor_ids or frozenset()
         self.copy_stream = current_omni_platform.Stream()
+        self._external_resident_tensor_ids = self.resident_tensor_ids
+        self._adaln_cache = AdaLNWeightCache(device)
         self._blocks: list[list[nn.Module]] = []
         self._dit_hooks: list[LayerwiseOffloadHook] = []
         self._hooked_dit_blocks: list[nn.Module] = []
         self._encoder_modules: list[nn.Module] = []
         self._staged_components: list[nn.Module] = []
+
+    @property
+    def adaln_cache_status(self) -> AdaLNCacheStatus:
+        return self._adaln_cache.status
 
     def enable(self, pipeline: nn.Module) -> None:
         try:
@@ -453,9 +495,19 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
         logger.info("Applying layer-wise offloading on %s", [component.path for component in resolved.dits])
 
+        streamable_dits: Iterable[tuple[ResolvedComponent, BlockStack]] = iter_streamable_dits(resolved, self.device)
+        if self.config.cache_adaln:
+            streamable_dits = list(streamable_dits)
+            cached_ids = self._adaln_cache.prepare(
+                (component.module for component, _ in streamable_dits),
+                max_gib=self.config.adaln_cache_max_gib,
+                reserve_gib=self.config.adaln_cache_reserve_gib,
+            )
+            self.resident_tensor_ids = self._external_resident_tensor_ids | cached_ids
+
         # Apply block-wise offloading hook for each of the blocks in DiT model(s)
         # Note that there might exist multiple DiT models in specific pipelines
-        for component, stack in iter_streamable_dits(resolved, self.device):
+        for component, stack in streamable_dits:
             dit_module = component.module
             blocks = list(stack.blocks)
 
@@ -468,6 +520,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
                 self.device,
                 self.copy_stream,
                 self.config.pin_cpu_memory,
+                resident_tensor_ids=self.resident_tensor_ids,
             )
             self._dit_hooks.extend(block_hooks)
             self._hooked_dit_blocks.extend(blocks)
@@ -485,7 +538,11 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
     def _disable(self, *, restore_weights: bool) -> None:
         if not self.enabled and not (
-            self._dit_hooks or self._hooked_dit_blocks or self._encoder_modules or self._staged_components
+            self._dit_hooks
+            or self._hooked_dit_blocks
+            or self._encoder_modules
+            or self._staged_components
+            or self._adaln_cache.resident_ids
         ):
             return
 
@@ -511,6 +568,8 @@ class LayerWiseOffloadBackend(OffloadBackend):
             # Keep every host-master reference so a transient teardown error
             # can be retried without losing weights behind placeholders.
             raise RuntimeError("Failed to fully disable layerwise offload") from cleanup_error
+        self._adaln_cache.restore()
+        self.resident_tensor_ids = self._external_resident_tensor_ids
         self._blocks.clear()
         self._dit_hooks.clear()
         self._hooked_dit_blocks.clear()

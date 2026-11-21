@@ -42,6 +42,45 @@ vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --diffusion-offload-config '{"mode":"layer","components":["dit"]}'
 ```
 
+## Optional AdaLN weight cache
+
+`--cache-adaln` keeps the loaded DiT tensors in AdaLN-named modules on the
+device while ordinary layerwise offload continues to stream other weights.
+It is disabled by default. Use `--no-cache-adaln` to explicitly disable it.
+The same Python/stage-config fields are `cache_adaln`,
+`adaln_cache_max_gib`, and `adaln_cache_reserve_gib`.
+
+```bash
+vllm serve /path/to/model --omni --enable-layerwise-offload \
+  --cache-adaln --adaln-cache-max-gib 25 --adaln-cache-reserve-gib 8
+
+vllm serve /path/to/model --omni --enable-layerwise-offload --no-cache-adaln
+```
+
+It also works with `--diffusion-offload-config
+'{"mode":"layer","components":["dit"]}'`. Model-level offload, distributed
+layerwise offload, and an encoder-only offload selection reject this option.
+
+The per-device cache limit defaults to 25 GiB. Admission also requires at
+least 8 GiB free after allocation, configurable with
+`--adaln-cache-reserve-gib`. Exceeding a limit, unavailable memory telemetry,
+unsupported tensors, or cache allocation/copy failure leaves ordinary LO
+active. Logs state whether caching was enabled and the fallback reason.
+The reserve is a startup admission check, not an upper bound on future
+activation or VAE memory; choose it for the workload and disable the cache
+when additional headroom is needed.
+
+Weights, biases, and quantization buffers/scales retain their loaded dtype and
+stride. The cache policy is independent of attention precision. MiniMax-H3's
+RF-v2 BF16/FP16 and RF-v3 BF16/FP16, `mix` (A5 Eagle QBSA), and `mxfp8` (A5
+CANN) accept the same policy. INT8/FP8 weights and E8M0 scale storage are not
+converted to BF16. A5 still requires its attention runtime and operators;
+CPU config/storage checks do not establish A5 device precision, memory
+capacity, or performance acceptance.
+
+This option caches AdaLN only; it does not enable the retired additional
+MLP fc1 cache or per-request weight staging experiment.
+
 ## Component selection
 
 Add `dit`, `text_encoder`, or both to the `components` list. Omitting
