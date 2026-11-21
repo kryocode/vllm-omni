@@ -63,9 +63,11 @@ the SDK serial schedule for diagnosis. All four controls default to true.
 before RoPE, relabels text/image/audio/output positions and lets SD skip per-layer
 row permutation while preserving RF order. Sparse step/layer gates still apply.
 
-For the validated AICPU communication mode, set
+To select the AICPU communication mode, set
 `VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE=2` before startup. It selects the HCCL
-engine only for Ulysses groups; verify all participating ranks' group logs.
+engine for both Ulysses and AllGather-KV (CP) groups. Both paths therefore use
+AICPU rather than leaving CP on the global default engine. Verify all
+participating ranks' Ulysses and AllGather-KV group logs.
 
 ## Execution and state ownership
 

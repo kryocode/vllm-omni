@@ -610,7 +610,8 @@ def build_ulysses_allgather_rank_groups(
     return ulysses_groups, allgather_groups
 
 
-def _new_ulysses_group(ranks):
+def _new_sequence_parallel_group(ranks: list[int], kind: str):
+    """Apply the selected HCCL engine to both Ulysses and AllGather-KV."""
     mode = envs.VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE
     if mode is None:
         return torch.distributed.new_group(ranks)
@@ -621,8 +622,16 @@ def _new_ulysses_group(ranks):
     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
     options.hccl_config = {"hccl_op_expansion_mode": mode}
     group = torch.distributed.new_group(ranks, backend="hccl", pg_options=options)
-    logger.info("Ulysses HCCL group ranks=%s expansion_mode=%d", ranks, mode)
+    logger.info("%s HCCL group ranks=%s expansion_mode=%d", kind, ranks, mode)
     return group
+
+
+def _new_ulysses_group(ranks: list[int]):
+    return _new_sequence_parallel_group(ranks, "Ulysses")
+
+
+def _new_allgather_group(ranks: list[int]):
+    return _new_sequence_parallel_group(ranks, "AllGather-KV")
 
 
 def _set_ulysses_allgather_pg(
@@ -654,7 +663,7 @@ def _set_ulysses_allgather_pg(
         if rank in ranks:
             ulysses_pg = group
     for ranks in allgather_groups:
-        group = torch.distributed.new_group(ranks)
+        group = _new_allgather_group(ranks)
         if rank in ranks:
             allgather_pg = group
     for singleton_rank in range(world_size):
@@ -743,7 +752,7 @@ def set_seq_parallel_pg(
 
         ulysses_pg = ring_pg = allgather_pg = None
         for group_ranks in sp_group_ranks:
-            group = torch.distributed.new_group(group_ranks)
+            group = _new_allgather_group(group_ranks)
             if rank in group_ranks:
                 allgather_pg = group
         for singleton_rank in range(world_size):
