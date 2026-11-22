@@ -119,6 +119,11 @@ def _sd16_cache_path(od_config: OmniDiffusionConfig) -> bool:
     )
 
 
+def _worker_threads() -> list[int]:
+    """Enumerate only threads belonging to the current worker process."""
+    return [int(path.name) for path in Path("/proc/self/task").iterdir() if path.name.isdigit()]
+
+
 def maybe_bind_npu_offload_cpu(od_config: OmniDiffusionConfig, device: torch.device | None) -> bool:
     """Bind before weight loading; explicit additional_config overrides auto policy.
 
@@ -126,7 +131,7 @@ def maybe_bind_npu_offload_cpu(od_config: OmniDiffusionConfig, device: torch.dev
     incoming CPU allowance; explicit True requires successful binding.
     Neither IRQ settings nor process-wide memory policy are modified.
     """
-    if device is None or device.type != "npu":
+    if device is None or getattr(device, "type", None) != "npu":
         return False
     options = getattr(od_config, "additional_config", None) or {}
     requested = options.get("enable_cpu_binding")
@@ -136,8 +141,7 @@ def maybe_bind_npu_offload_cpu(od_config: OmniDiffusionConfig, device: torch.dev
         return False
     if requested is None and not _sd16_cache_path(od_config):
         return False
-    before: set[int] | None = None
-    changed = False
+    changed: dict[int, set[int]] = {}
     try:
         if device.index is None:
             raise RuntimeError("CPU binding requires an indexed NPU device")
@@ -146,17 +150,35 @@ def maybe_bind_npu_offload_cpu(od_config: OmniDiffusionConfig, device: torch.dev
         target = before & local_cpus
         if not target:
             raise RuntimeError("no allowed CPUs on the NPU NUMA node")
-        if target != before:
-            os.sched_setaffinity(0, target)
-            changed = True
+        # The loader may run after OpenMP and backend thread pools were created.
+        # Binding only its calling thread leaves those pools free to first-touch
+        # weight buffers on another socket. Preserve each thread's own limits.
+        for tid in _worker_threads():
+            try:
+                allowed = set(os.sched_getaffinity(tid))
+                local = allowed & local_cpus
+                if local and local != allowed:
+                    os.sched_setaffinity(tid, local)
+                    changed[tid] = allowed
+            except ProcessLookupError:
+                continue
         actual = set(os.sched_getaffinity(0))
         if not actual or not actual <= target:
             raise RuntimeError("CPU binding verification failed")
-        logger.info("NPU offload CPU binding: physical_device=%d numa_node=%d CPUs=%s", physical, node, sorted(actual))
+        logger.info(
+            "NPU offload CPU binding: physical_device=%d numa_node=%d CPUs=%s existing_threads_bound=%d",
+            physical,
+            node,
+            sorted(actual),
+            len(changed),
+        )
         return True
     except (OSError, RuntimeError, ValueError, AttributeError) as exc:
-        if changed and before is not None:
-            os.sched_setaffinity(0, before)
+        for tid, allowed in changed.items():
+            try:
+                os.sched_setaffinity(tid, allowed)
+            except ProcessLookupError:
+                continue
         if requested is True:
             raise RuntimeError(f"requested NPU CPU binding failed: {exc}") from exc
         logger.warning("NPU offload CPU binding unavailable; preserving incoming affinity: %s", exc)

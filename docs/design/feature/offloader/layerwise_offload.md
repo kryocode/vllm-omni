@@ -75,7 +75,9 @@ will fit; this policy does not provide an automatic generation retry.
   PCIe NUMA topology. Native Omni and SD8 do not trigger this automatic policy.
   `additional_config.enable_cpu_binding` overrides the automatic
   policy. An explicit false preserves incoming affinity; explicit true
-  requires successful binding. This changes process CPU placement only;
+  requires successful binding. Binding runs before device initialization and
+  again before loading, covering existing worker thread pools without
+  widening their individual CPU limits. This changes worker CPU placement only;
   cache ownership, tensor layout, restoration and the hook ring are unchanged.
 - Each offloaded tensor has one pinned host backing store.
 - Parameter identity is preserved when storage is rebound.

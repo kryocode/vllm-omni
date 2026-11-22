@@ -92,6 +92,9 @@ MLP fc1 cache or per-request weight staging experiment.
 For the MindIE-SD 16-device Ulysses-8 x CP-2 path, with NPU layerwise offload
 and `cache_adaln` enabled, the loader automatically limits the worker's CPU
 affinity to allowed CPUs on the target NPU's NUMA node before loading weights.
+The worker applies this before device/distributed initialization and the
+loader checks again before weights are allocated. Existing thread pools are
+included, and newly created threads inherit their creator's CPU affinity.
 Native Omni and SD8 keep their incoming affinity by default.
 This helps host allocation and weight-transfer locality
 when DiT compute becomes too short to hide H2D transfers. Physical device
@@ -115,7 +118,7 @@ The Python/stage-config equivalent is
 `additional_config={"enable_cpu_binding": False}` or `True`. The automatic
 policy preserves incoming affinity if topology or permitted local CPUs are
 unavailable; explicit `True` reports a binding failure. Binding only affects
-the current worker process and does not migrate process-wide NUMA pages or
+eligible threads in the current worker process and does not migrate process-wide NUMA pages or
 change device IRQ affinity.
 
 ## Component selection

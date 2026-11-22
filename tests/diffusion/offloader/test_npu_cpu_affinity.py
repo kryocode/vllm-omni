@@ -35,6 +35,7 @@ def runtime(monkeypatch):
     monkeypatch.setattr(affinity.os, "sched_getaffinity", lambda pid: set(current["cpus"]))
     monkeypatch.setattr(affinity.os, "sched_setaffinity", lambda pid, cpus: current.update(cpus=set(cpus)))
     monkeypatch.setattr(affinity, "_npu_affinity", lambda index: (8, 1, {2, 3, 99}))
+    monkeypatch.setattr(affinity, "_worker_threads", lambda: [0], raising=False)
     return current
 
 
@@ -58,6 +59,32 @@ def test_existing_narrow_binding_is_preserved(runtime):
     runtime["cpus"] = {3}
     assert affinity.maybe_bind_npu_offload_cpu(config(), SimpleNamespace(type="npu", index=0))
     assert runtime["cpus"] == {3}
+
+
+def test_existing_thread_pools_are_bound_without_widening(monkeypatch):
+    masks = {0: {0, 1, 2, 3}, 7: {0, 1, 2, 3}, 9: {3}}
+    monkeypatch.setattr(affinity, "_worker_threads", lambda: [0, 7, 9], raising=False)
+    monkeypatch.setattr(affinity.os, "sched_getaffinity", lambda tid: set(masks[tid]))
+    monkeypatch.setattr(affinity.os, "sched_setaffinity", lambda tid, cpus: masks.update({tid: set(cpus)}))
+    monkeypatch.setattr(affinity, "_npu_affinity", lambda index: (8, 1, {2, 3, 99}))
+    assert affinity.maybe_bind_npu_offload_cpu(config(), SimpleNamespace(type="npu", index=0))
+    assert masks == {0: {2, 3}, 7: {2, 3}, 9: {3}}
+
+
+def test_partial_thread_binding_failure_restores_earlier_threads(monkeypatch):
+    masks = {0: {0, 1, 2, 3}, 7: {0, 1, 2, 3}}
+    monkeypatch.setattr(affinity, "_worker_threads", lambda: [0, 7], raising=False)
+    monkeypatch.setattr(affinity.os, "sched_getaffinity", lambda tid: set(masks[tid]))
+
+    def bind(tid, cpus):
+        if tid == 7:
+            raise PermissionError("thread affinity denied")
+        masks[tid] = set(cpus)
+
+    monkeypatch.setattr(affinity.os, "sched_setaffinity", bind)
+    monkeypatch.setattr(affinity, "_npu_affinity", lambda index: (8, 1, {2, 3, 99}))
+    assert not affinity.maybe_bind_npu_offload_cpu(config(), SimpleNamespace(type="npu", index=0))
+    assert masks == {0: {0, 1, 2, 3}, 7: {0, 1, 2, 3}}
 
 
 def test_no_allowed_local_cpu_does_not_widen_limits(runtime, monkeypatch):
@@ -104,6 +131,32 @@ def test_loader_binds_before_entering_weight_loading(monkeypatch):
     with pytest.raises(RuntimeError, match="weight-load sentinel"):
         loader.load_model("cpu", device=SimpleNamespace(type="npu", index=0))
     assert loader.cpu_affinity_bound
+
+
+def test_worker_binds_before_device_runtime_initialization(monkeypatch):
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker, current_omni_platform
+
+    worker = object.__new__(DiffusionWorker)
+    worker.od_config = config()
+    worker.od_config.num_gpus = 16
+    worker.rank = worker.local_rank = 0
+    worker.distributed_init_method = "env://"
+    calls = []
+
+    def bind(cfg, device):
+        calls.append("bind")
+        return True
+
+    monkeypatch.setattr(affinity, "maybe_bind_npu_offload_cpu", bind)
+    monkeypatch.setattr(current_omni_platform, "get_torch_device", lambda rank: SimpleNamespace(type="npu", index=0))
+
+    def initialize(device):
+        assert calls == ["bind"]
+        raise RuntimeError("device-init sentinel")
+
+    monkeypatch.setattr(current_omni_platform, "set_device", initialize)
+    with pytest.raises(RuntimeError, match="device-init sentinel"):
+        worker.init_device()
 
 
 def test_explicit_binding_reports_failure(runtime, monkeypatch):
