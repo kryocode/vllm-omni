@@ -7,6 +7,8 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -122,6 +124,48 @@ def _sd16_cache_path(od_config: OmniDiffusionConfig) -> bool:
 def _worker_threads() -> list[int]:
     """Enumerate only threads belonging to the current worker process."""
     return [int(path.name) for path in Path("/proc/self/task").iterdir() if path.name.isdigit()]
+
+
+@contextmanager
+def npu_worker_start_affinity(od_config: OmniDiffusionConfig, device_index: int, *, is_npu: bool) -> Iterator[None]:
+    """Let a fresh worker inherit local CPUs before Python imports Torch.
+
+    Only the spawning thread is temporarily narrowed. Its incoming affinity is
+    restored even if process.start() fails; sibling threads are untouched.
+    """
+    if not is_npu:
+        yield
+        return
+    options = getattr(od_config, "additional_config", None) or {}
+    requested = options.get("enable_cpu_binding")
+    if requested is not None and not isinstance(requested, bool):
+        raise ValueError("additional_config.enable_cpu_binding must be a boolean")
+    if requested is False or (requested is None and not _sd16_cache_path(od_config)):
+        yield
+        return
+    before: set[int] | None = None
+    try:
+        before = set(os.sched_getaffinity(0))
+        physical, node, local_cpus = _npu_affinity(device_index)
+        target = before & local_cpus
+        if not target:
+            raise RuntimeError("no allowed CPUs on the NPU NUMA node")
+        os.sched_setaffinity(0, target)
+        if set(os.sched_getaffinity(0)) != target:
+            raise RuntimeError("worker start CPU binding verification failed")
+    except (OSError, RuntimeError, ValueError, AttributeError) as exc:
+        if before is not None:
+            os.sched_setaffinity(0, before)
+        if requested is True:
+            raise RuntimeError(f"requested worker start CPU binding failed: {exc}") from exc
+        logger.warning("Worker start CPU binding unavailable; preserving incoming affinity: %s", exc)
+        yield
+        return
+    try:
+        logger.info("Starting NPU worker: physical_device=%d numa_node=%d CPUs=%s", physical, node, sorted(target))
+        yield
+    finally:
+        os.sched_setaffinity(0, before)
 
 
 def maybe_bind_npu_offload_cpu(od_config: OmniDiffusionConfig, device: torch.device | None) -> bool:

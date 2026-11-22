@@ -121,6 +121,12 @@ unavailable; explicit `True` reports a binding failure. Binding only affects
 eligible threads in the current worker process and does not migrate process-wide NUMA pages or
 change device IRQ affinity.
 
+For the local multiprocessing executor, each new worker inherits its local CPU
+allowance before Python imports Torch. The launching thread temporarily adopts
+that allowance only for process startup and then restores its original CPUs.
+Direct in-process loading and Ray workers retain the later initialization and
+loading checks; this startup guarantee applies to local spawned workers.
+
 ## Component selection
 
 Add `dit`, `text_encoder`, or both to the `components` list. Omitting

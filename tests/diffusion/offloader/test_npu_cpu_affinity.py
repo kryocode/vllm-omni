@@ -2,7 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Offload locality respects visible devices, explicit overrides and CPU limits."""
 
+import importlib
 import json
+import multiprocessing
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -42,6 +47,128 @@ def runtime(monkeypatch):
 def test_auto_binding_intersects_incoming_cpu_limits(runtime):
     assert affinity.maybe_bind_npu_offload_cpu(config(), SimpleNamespace(type="npu", index=0))
     assert runtime["cpus"] == {2, 3}
+
+
+def test_worker_start_affinity_restores_parent_after_each_device(runtime, monkeypatch):
+    monkeypatch.setattr(affinity, "_npu_affinity", lambda index: (index, index, {index}))
+    for index in (0, 1):
+        with affinity.npu_worker_start_affinity(config(), index, is_npu=True):
+            assert runtime["cpus"] == {index}
+        assert runtime["cpus"] == {0, 1, 2, 3}
+
+
+def test_worker_start_failure_restores_parent(runtime):
+    with pytest.raises(RuntimeError, match="spawn failed"):
+        with affinity.npu_worker_start_affinity(config(), 0, is_npu=True):
+            assert runtime["cpus"] == {2, 3}
+            raise RuntimeError("spawn failed")
+    assert runtime["cpus"] == {0, 1, 2, 3}
+
+
+def test_executor_start_uses_local_cpus_and_restores_on_failure(runtime, monkeypatch):
+    from unittest.mock import MagicMock
+
+    from vllm_omni.diffusion.executor import multiproc_executor
+
+    cfg = config()
+    cfg.num_gpus = 16
+    cfg.worker_extension_cls = None
+    context = MagicMock()
+    context.Pipe.return_value = (MagicMock(), MagicMock())
+    process = context.Process.return_value
+
+    def failed_start():
+        assert runtime["cpus"] == {2, 3}
+        raise RuntimeError("executor spawn failed")
+
+    process.start.side_effect = failed_start
+    monkeypatch.setattr(multiproc_executor.current_omni_platform, "is_npu", lambda: True)
+    monkeypatch.setattr(multiproc_executor, "set_multiprocessing_worker_envs", lambda: None)
+    monkeypatch.setattr(multiproc_executor.mp, "set_start_method", lambda *args, **kwargs: None)
+    executor = object.__new__(multiproc_executor.MultiprocDiffusionExecutor)
+    executor.od_config = cfg
+    executor._mp_context = context
+    with pytest.raises(RuntimeError, match="executor spawn failed"):
+        executor._launch_workers(MagicMock(), [MagicMock()] * 16)
+    assert runtime["cpus"] == {0, 1, 2, 3}
+
+
+@pytest.mark.parametrize("npu,options", [(False, {}), (True, {"enable_cpu_binding": False})])
+def test_worker_start_disabled_does_not_query_topology(runtime, monkeypatch, npu, options):
+    def unexpected(index):
+        raise AssertionError("disabled start queried topology")
+
+    monkeypatch.setattr(affinity, "_npu_affinity", unexpected)
+    with affinity.npu_worker_start_affinity(config(**options), 0, is_npu=npu):
+        assert runtime["cpus"] == {0, 1, 2, 3}
+
+
+def test_worker_start_auto_topology_failure_preserves_parent(runtime, monkeypatch):
+    def unavailable(index):
+        raise RuntimeError("topology unavailable")
+
+    monkeypatch.setattr(affinity, "_npu_affinity", unavailable)
+    with affinity.npu_worker_start_affinity(config(), 0, is_npu=True):
+        assert runtime["cpus"] == {0, 1, 2, 3}
+    with pytest.raises(RuntimeError, match="requested worker start"):
+        with affinity.npu_worker_start_affinity(config(enable_cpu_binding=True), 0, is_npu=True):
+            pytest.fail("explicit binding failure started a worker")
+
+
+def test_worker_start_affinity_is_inherited_before_imports(monkeypatch):
+    before = os.sched_getaffinity(0)
+    local = {min(before)}
+    monkeypatch.setattr(affinity, "_npu_affinity", lambda index: (index, 0, local))
+    with affinity.npu_worker_start_affinity(config(), 0, is_npu=True):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import json,os,sys; print(json.dumps([sorted(os.sched_getaffinity(0)), 'torch' in sys.modules]))",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert json.loads(result.stdout) == [sorted(local), False]
+    assert os.sched_getaffinity(0) == before
+
+
+def test_real_spawn_inherits_start_affinity(monkeypatch, tmp_path):
+    # The probe module itself records affinity before any Torch imports. This
+    # exercises the same spawn context used by the real diffusion executor.
+    probe = tmp_path / "affinity_spawn_probe.py"
+    probe.write_text(
+        "import os\n"
+        "IMPORT_AFFINITY = sorted(os.sched_getaffinity(0))\n"
+        "def report(pipe):\n"
+        "    pipe.send(IMPORT_AFFINITY)\n"
+        "    pipe.close()\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    module = importlib.import_module("affinity_spawn_probe")
+    before = os.sched_getaffinity(0)
+    local = {min(before)}
+    monkeypatch.setattr(affinity, "_npu_affinity", lambda index: (index, 0, local))
+    context = multiprocessing.get_context("spawn")
+    reader, writer = context.Pipe(duplex=False)
+    process = context.Process(target=module.report, args=(writer,))
+    try:
+        with affinity.npu_worker_start_affinity(config(), 0, is_npu=True):
+            process.start()
+        writer.close()
+        assert os.sched_getaffinity(0) == before
+        assert reader.poll(20)
+        assert reader.recv() == sorted(local)
+        process.join(20)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(10)
+        reader.close()
+        writer.close()
+        sys.modules.pop("affinity_spawn_probe", None)
 
 
 def test_explicit_false_skips_topology_and_preserves_affinity(runtime, monkeypatch):
