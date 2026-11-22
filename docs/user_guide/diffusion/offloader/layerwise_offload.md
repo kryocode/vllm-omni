@@ -78,6 +78,12 @@ converted to BF16. A5 still requires its attention runtime and operators;
 CPU config/storage checks do not establish A5 device precision, memory
 capacity, or performance acceptance.
 
+MiniMax-H3 keeps its original 101-tensor cache scope for the current INT8
+checkpoint. The final AdaLN projection's `linear.weight` and `weight_scale`
+already remain on device outside the streamed blocks and are excluded from
+this cache; its BF16 bias remains included. Quantized AdaLN weights and scales
+inside transformer blocks continue to retain their loaded representations.
+
 This option caches AdaLN only; it does not enable the retired additional
 MLP fc1 cache or per-request weight staging experiment.
 

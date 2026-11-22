@@ -56,6 +56,8 @@ does not depend on attention precision or a device generation.
 Cache preparation copies every selected tensor with its recorded dtype and
 stride before rebinding any model storage. Budget, memory-query, or copy
 failure rolls back cache-owned state and leaves ordinary LO available.
+MiniMax-H3's non-block final AdaLN projection weight and scale are excluded
+from the cache; the current checkpoint retains the original 101-tensor scope.
 Selected tensors are excluded from both sides of the hook ring and from
 materialization probes, so a cached tensor cannot hide missing streamed
 weights. Other block weights continue to use the original hook protocol.

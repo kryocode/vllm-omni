@@ -45,6 +45,14 @@ def select_adaln_tensors(modules: Iterable[nn.Module]) -> list[tuple[str, torch.
         for name, tensor in list(module.named_parameters()) + buffers:
             if id(tensor) in seen:
                 continue
+            # MiniMax-H3's final quantized projection already remains on device
+            # outside the streamed blocks. Preserve the original 101-tensor
+            # residency scope without filtering quantized tensors in the blocks.
+            if ".final_layer.adaln_proj.linear." in f".{name}" and name.split(".")[-1] in {
+                "weight",
+                "weight_scale",
+            }:
+                continue
             if any("adaln" in part.replace("_", "").casefold() for part in name.split(".")):
                 seen.add(id(tensor))
                 selected.append((f"{index}.{name}", tensor))

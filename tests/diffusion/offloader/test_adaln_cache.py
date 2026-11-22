@@ -85,6 +85,23 @@ def test_shared_tensors_are_cached_once():
     assert len(adaln_cache.select_adaln_tensors([block, block])) == 2
 
 
+def test_minimax_final_projection_retains_original_cache_scope():
+    module = nn.Module()
+    module.blocks = nn.ModuleList([Block()])
+    module.final_layer = nn.Module()
+    module.final_layer.adaln_proj = nn.Module()
+    projection = nn.Module()
+    projection.weight = nn.Parameter(torch.ones((2, 2), dtype=torch.int8), requires_grad=False)
+    projection.register_buffer("weight_scale", torch.ones(2, dtype=torch.float32))
+    projection.bias = nn.Parameter(torch.ones(2, dtype=torch.bfloat16), requires_grad=False)
+    module.final_layer.adaln_proj.linear = projection
+    selected = {id(t) for _, t in adaln_cache.select_adaln_tensors([module])}
+    assert id(projection.weight) not in selected
+    assert id(projection.weight_scale) not in selected
+    assert id(projection.bias) in selected
+    assert id(module.blocks[0].adaLN_modulation.weight) in selected
+
+
 def test_activation_buffers_are_not_selected_as_static_weights():
     block = Block()
     block.adaLN_modulation.register_buffer("activation_cache", torch.ones(16))
