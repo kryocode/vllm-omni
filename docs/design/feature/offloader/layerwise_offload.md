@@ -70,6 +70,13 @@ will fit; this policy does not provide an automatic generation retry.
 
 ## Invariants and limitations
 
+- Before loading NPU weights for cached MindIE-SD U8 x CP2 execution on 16
+  devices, the diffusion loader selects allowed CPUs from the device's actual
+  PCIe NUMA topology. Native Omni and SD8 do not trigger this automatic policy.
+  `additional_config.enable_cpu_binding` overrides the automatic
+  policy. An explicit false preserves incoming affinity; explicit true
+  requires successful binding. This changes process CPU placement only;
+  cache ownership, tensor layout, restoration and the hook ring are unchanged.
 - Each offloaded tensor has one pinned host backing store.
 - Parameter identity is preserved when storage is rebound.
 - Blocks with heterogeneous shapes and dtypes use their recorded metadata;

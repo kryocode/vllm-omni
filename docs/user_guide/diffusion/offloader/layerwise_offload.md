@@ -87,6 +87,37 @@ inside transformer blocks continue to retain their loaded representations.
 This option caches AdaLN only; it does not enable the retired additional
 MLP fc1 cache or per-request weight staging experiment.
 
+## NPU CPU locality
+
+For the MindIE-SD 16-device Ulysses-8 x CP-2 path, with NPU layerwise offload
+and `cache_adaln` enabled, the loader automatically limits the worker's CPU
+affinity to allowed CPUs on the target NPU's NUMA node before loading weights.
+Native Omni and SD8 keep their incoming affinity by default.
+This helps host allocation and weight-transfer locality
+when DiT compute becomes too short to hide H2D transfers. Physical device
+visibility and PCIe topology determine the node; affinity never expands beyond
+the incoming CPU allowance. Tensor dtype, layout, cache size and CPU recovery
+are unchanged.
+
+Use the existing public `additional_config` option to override this policy:
+
+```bash
+# Preserve the worker's incoming CPU affinity.
+vllm serve /path/to/model --omni --enable-layerwise-offload --cache-adaln \
+  --additional-config '{"enable_cpu_binding":false}'
+
+# Require successful NPU CPU binding.
+vllm serve /path/to/model --omni --enable-layerwise-offload --cache-adaln \
+  --additional-config '{"enable_cpu_binding":true}'
+```
+
+The Python/stage-config equivalent is
+`additional_config={"enable_cpu_binding": False}` or `True`. The automatic
+policy preserves incoming affinity if topology or permitted local CPUs are
+unavailable; explicit `True` reports a binding failure. Binding only affects
+the current worker process and does not migrate process-wide NUMA pages or
+change device IRQ affinity.
+
 ## Component selection
 
 Add `dit`, `text_encoder`, or both to the `components` list. Omitting
