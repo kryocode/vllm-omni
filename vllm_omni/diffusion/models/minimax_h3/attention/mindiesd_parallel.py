@@ -47,10 +47,8 @@ class MindIEParallelResource:
         sparse_type: str = "rf_v3",
         bsa_backend: str | None = None,
     ):
-        self.group = group
         self.device = device
         self.config = config
-        self.cp_group = cp_group
         self.precision = precision
         self.sparse_type = sparse_type
         self.bsa_backend = resolve_mindie_sparse_backend(sparse_type, precision, bsa_backend)

@@ -162,7 +162,9 @@ def test_pipeline_call_is_explicit_and_state_is_reused(adapter):
         ("mindiesd", adapter.group, None, adapter.query.device, "rf_v3", "bf16", "eagle"), lambda: None
     )
     assert resource.completed_calls == 2
+    assert not {"group", "cp_group"}.intersection(vars(resource))
     state = adapter.states[0]
+    assert state.group is adapter.group
     assert state.overlap_comm is True
     assert state.optimize_attention_pipeline is True
     assert state.bsa_backend == "eagle"
