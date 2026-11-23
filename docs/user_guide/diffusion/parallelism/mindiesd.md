@@ -25,7 +25,7 @@ Admission requires Ascend NPU, equal `[1,S_local,H,D]` Q/K/V, strict Ulysses and
 heads divisible by its degree. FP16 converts BF16 producer operands explicitly
 and restores the producer dtype; quantized paths consume BF16 producer tensors.
 Pure Ulysses passes `cp_group=None` and accepts either RF input order.
-CP x Ulysses uses the existing `ulysses_allgather_kv` strategy and passes the
+CP x Ulysses uses the existing `ulysses_allgather_kv` strategy and supplies the
 coordinator's orthogonal `allgather_group` as the actual `cp_group`. It requires
 `pre_rearranged=True`, Ulysses degree 4 or 8, CP degree 2 or 4, global sequence
 world 8, 16 or 32, and D128. MXFP8 also requires D128 in pure Ulysses.
@@ -48,8 +48,7 @@ Enable the executor through `block_sparse.parallel`:
       "parallel": {
         "overlap_comm": true,
         "reorder_hoist": true,
-        "optimize_attention_pipeline": true,
-        "chunk_ready_pipeline": true
+        "optimize_attention_pipeline": true
       }
     }
   }
@@ -57,9 +56,10 @@ Enable the executor through `block_sparse.parallel`:
 ```
 
 Omit `parallel` to retain ordinary Omni attention. `overlap_comm=false` selects
-the SDK serial schedule for diagnosis. All four controls default to true.
-`optimize_attention_pipeline` enables SDK preparation/buffer reuse and
-`chunk_ready_pipeline` enables its chunk scheduling; both can be disabled explicitly. `reorder_hoist` builds the RF plan once
+the SDK serial schedule for diagnosis. All three controls default to true.
+With overlap enabled, the SDK submits all forward transfers before computing
+the ready chunks. `optimize_attention_pipeline` enables SDK preparation/buffer
+reuse and can be disabled explicitly. `reorder_hoist` builds the RF plan once
 before RoPE, relabels text/image/audio/output positions and lets SD skip per-layer
 row permutation while preserving RF order. Sparse step/layer gates still apply.
 
@@ -97,3 +97,17 @@ precision, sparsity, NFE and cards, with two complete warmups before formal
 timing. Record HTTP/media completion, actual NFE, SDK engagement, Diffuse/E2E
 latency and measured peak memory. CPU tests do not establish native numerics;
 fusion/NZ measurements do not establish this parallel-only path's performance.
+
+## A5 CPU binding
+
+Set `additional_config={"enable_cpu_binding": true}` to bind each NPU worker and
+its threads to permitted CPUs on that device's NUMA node before model loading.
+Use `false` to preserve incoming CPU affinity. The DCMI adapter supports the
+legacy API and the Ascend 950 device-id API, including reordered device visibility.
+This option is independent of sparse precision and does not enable LO.
+
+AdaLN weight residency caching is not enabled on A5: the cache admission returns
+`unsupported_on_a5` before selecting or allocating tensors. Keep `cache_adaln=false`.
+The existing AdaLN projection-result cache is unchanged. CPU binding support and
+measured latency gains are separate conclusions; qualify each model/topology with
+matching frozen-source hot samples and output comparison.

@@ -61,7 +61,6 @@ class MindIEParallelResource:
             cp_group=cp_group,
             overlap_comm=config.overlap_comm,
             optimize_attention_pipeline=config.optimize_attention_pipeline,
-            chunk_ready_pipeline=config.chunk_ready_pipeline,
             bsa_backend=self.bsa_backend,
         )
         self.failed = False
@@ -93,8 +92,6 @@ class MindIEParallelResource:
                 k,
                 v,
                 spans,
-                group=self.group,
-                cp_group=self.cp_group,
                 state=self.state,
                 sparse_type=self.sparse_type,
                 used_len=used_len,

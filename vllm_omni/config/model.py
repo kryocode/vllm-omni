@@ -3,7 +3,7 @@
 
 import copy
 from dataclasses import MISSING, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import ConfigDict, TypeAdapter
 from transformers import PretrainedConfig
@@ -19,6 +19,9 @@ from vllm.transformers_utils.model_arch_config_convertor import (
 )
 
 import vllm_omni.model_executor.models as me_models
+
+if TYPE_CHECKING:
+    from vllm.config.utils import CompileFactors
 
 logger = init_logger(__name__)
 
@@ -134,7 +137,7 @@ class OmniModelConfig(ModelConfig):
     supports_pending_generation: bool = False
     supports_running_prefix_cache_reset: bool = True
     recompute_preemption: Literal["allow", "fail"] = "allow"
-    use_v2_model_runner: bool = False
+    use_v2_model_runner: bool = True
     supports_native_mrv2_data_plane: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
@@ -170,13 +173,13 @@ class OmniModelConfig(ModelConfig):
     requires_full_payload_input: bool = False
     scheduling_metadata_adapter: str | None = None
 
-    def compute_hash(self) -> str:
-        """Compute the hash for the Omni Model config to be used for the compile cache."""
+    def _normalized_compile_config(self):
+        """Normalize volatile connector identities on a copy for both cache APIs."""
         from vllm_omni.distributed.omni_connectors.utils.config import connector_hash_factors
 
-        # Remove hash factors on a copy of the object, then use the mutated copy to get the hash.
+        # Remove hash factors on a copy of the object, then use the mutated copy to get the factors.
         # This is a workaround to vLLM's ModelConfig not having a clean way of changing its config
-        # factors. See: https://github.com/vllm-project/vllm/blob/v0.31.0/vllm/config/model.py#L434
+        # factors.
         hashed = copy.copy(self)
 
         # connector config are handled here to ensure UUIDs don't cause compile cache misses
@@ -186,7 +189,15 @@ class OmniModelConfig(ModelConfig):
             hashed.omni_kv_config = dict(self.omni_kv_config)
             hashed.omni_kv_config["connector_config"] = connector_hash_factors(self.omni_kv_config["connector_config"])
 
-        return super(OmniModelConfig, hashed).compute_hash()
+        return hashed
+
+    def compile_factors(self) -> "CompileFactors":
+        """Use the vLLM 0.34 compile-factor API."""
+        return super(OmniModelConfig, self._normalized_compile_config()).compile_factors()
+
+    def compute_hash(self) -> str:
+        """Retain connector hash normalization with the A5 vLLM 0.33 runtime."""
+        return super(OmniModelConfig, self._normalized_compile_config()).compute_hash()
 
     @property
     def registry(self):

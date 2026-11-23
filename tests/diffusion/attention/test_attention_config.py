@@ -81,12 +81,12 @@ class TestAttentionSpec:
                 "sparse_type": sparse_type,
                 "precision": precision,
                 "bsa_backend": backend,
-                "parallel": {"optimize_attention_pipeline": True, "chunk_ready_pipeline": True},
+                "parallel": {"optimize_attention_pipeline": True},
             },
         ).backend_kwargs()
         assert config["precision"] == precision
         assert config["bsa_backend"] == backend
-        assert config["parallel"] == {"optimize_attention_pipeline": True, "chunk_ready_pipeline": True}
+        assert config["parallel"] == {"optimize_attention_pipeline": True}
 
     @pytest.mark.parametrize(
         "sparse_type,precision,backend",

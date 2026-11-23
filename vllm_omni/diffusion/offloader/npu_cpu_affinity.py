@@ -61,29 +61,46 @@ def _npu_affinity(index: int) -> tuple[int, int, set[int]]:
     library = ctypes.util.find_library("dcmi") or "/usr/local/Ascend/driver/lib64/driver/libdcmi.so"
     lib = ctypes.CDLL(library)
     lib.dcmi_init.restype = ctypes.c_int
-    if lib.dcmi_init() != 0:
-        raise RuntimeError("DCMI initialization failed")
-    lib.dcmi_get_device_phyid_from_logicid.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_uint)]
-    lib.dcmi_get_device_logicid_from_phyid.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_uint)]
-    lib.dcmi_get_card_id_device_id_from_logicid.argtypes = [
-        ctypes.POINTER(ctypes.c_int),
-        ctypes.POINTER(ctypes.c_int),
-        ctypes.c_uint,
-    ]
-    lib.dcmi_get_device_pcie_info_v2.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(_PcieInfo)]
+    use_v2 = lib.dcmi_init() != 0
+    if use_v2:
+        # Ascend 950 rejects the legacy DCMI API; use its device-id API.
+        initialize = getattr(lib, "dcmiv2_init", None)
+        if initialize is None or initialize() != 0:
+            raise RuntimeError("DCMI initialization failed")
+        phy_from_logic = lib.dcmiv2_get_chip_phy_id_by_dev_id
+        logic_from_phy = lib.dcmiv2_get_dev_id_by_chip_phy_id
+        id_type = ctypes.c_int
+    else:
+        phy_from_logic = lib.dcmi_get_device_phyid_from_logicid
+        logic_from_phy = lib.dcmi_get_device_logicid_from_phyid
+        id_type = ctypes.c_uint
+    phy_from_logic.argtypes = [id_type, ctypes.POINTER(ctypes.c_uint)]
+    logic_from_phy.argtypes = [id_type, ctypes.POINTER(ctypes.c_uint)]
     physical = _visible_physical_device(index)
     if physical is None:
         value = ctypes.c_uint()
-        if lib.dcmi_get_device_phyid_from_logicid(index, ctypes.byref(value)) != 0:
+        if phy_from_logic(index, ctypes.byref(value)) != 0:
             raise RuntimeError("cannot resolve physical NPU")
         physical = value.value
     logical = ctypes.c_uint()
-    if lib.dcmi_get_device_logicid_from_phyid(physical, ctypes.byref(logical)) != 0:
+    if logic_from_phy(physical, ctypes.byref(logical)) != 0:
         raise RuntimeError("cannot resolve logical NPU")
-    card, device, info = ctypes.c_int(), ctypes.c_int(), _PcieInfo()
-    if lib.dcmi_get_card_id_device_id_from_logicid(ctypes.byref(card), ctypes.byref(device), logical) != 0:
-        raise RuntimeError("cannot resolve NPU card and chip")
-    if lib.dcmi_get_device_pcie_info_v2(card, device, ctypes.byref(info)) != 0:
+    info = _PcieInfo()
+    if use_v2:
+        lib.dcmiv2_get_device_pcie_info.argtypes = [ctypes.c_int, ctypes.POINTER(_PcieInfo)]
+        result = lib.dcmiv2_get_device_pcie_info(logical.value, ctypes.byref(info))
+    else:
+        lib.dcmi_get_card_id_device_id_from_logicid.argtypes = [
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_uint,
+        ]
+        lib.dcmi_get_device_pcie_info_v2.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(_PcieInfo)]
+        card, device = ctypes.c_int(), ctypes.c_int()
+        if lib.dcmi_get_card_id_device_id_from_logicid(ctypes.byref(card), ctypes.byref(device), logical) != 0:
+            raise RuntimeError("cannot resolve NPU card and chip")
+        result = lib.dcmi_get_device_pcie_info_v2(card, device, ctypes.byref(info))
+    if result != 0:
         raise RuntimeError("cannot resolve NPU PCIe address")
     pci = Path("/sys/bus/pci/devices") / f"{info.domain:04x}:{info.bus:02x}:{info.slot:02x}.{info.function}"
     if int((pci / "vendor").read_text().strip(), 16) != 0x19E5:

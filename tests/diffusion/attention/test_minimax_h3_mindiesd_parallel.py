@@ -170,8 +170,6 @@ def test_pipeline_call_is_explicit_and_state_is_reused(adapter):
     assert q is k is v is adapter.query
     assert spans == [{"start": 6, "latent_shape": [2, 2, 2]}]
     assert kwargs == dict(
-        group=adapter.group,
-        cp_group=None,
         used_len=14,
         state=state,
         precision="bf16",
@@ -252,8 +250,8 @@ def test_cp_uses_the_existing_orthogonal_group_and_exact_sdk_keywords(
     q = torch.zeros((1, 32, 56, 128), dtype=dtype)
     assert torch.equal(run(adapter, query=q), q + 1)
     kwargs = adapter.calls[0][-1]
-    assert kwargs["group"] is adapter.group
-    assert kwargs["cp_group"] is adapter.coordinator.allgather_group
+    assert adapter.states[0].group is adapter.group
+    assert adapter.states[0].cp_group is adapter.coordinator.allgather_group
     assert adapter.states[0].cp_group is adapter.coordinator.allgather_group
     assert not {"kv_gather_group", "comm_dtype", "comm_quant_scope"}.intersection(kwargs)
 
@@ -280,11 +278,10 @@ def test_pipeline_optimization_switches_are_passed_without_overriding(adapter):
         overlap_comm=False,
         reorder_hoist=False,
         optimize_attention_pipeline=False,
-        chunk_ready_pipeline=False,
     )
     run(adapter)
     state = adapter.states[0]
-    assert state.overlap_comm is state.optimize_attention_pipeline is state.chunk_ready_pipeline is False
+    assert state.overlap_comm is state.optimize_attention_pipeline is False
 
 
 FIRST_TWO_PATHS = [
@@ -293,14 +290,14 @@ FIRST_TWO_PATHS = [
     ("rf_v3", "bf16", "eagle"),
     ("rf_v3", "fp16", "eagle"),
 ]
-CONTROL_COMBINATIONS = list(product((False, True), repeat=4))
+CONTROL_COMBINATIONS = list(product((False, True), repeat=3))
 
 
 @pytest.mark.parametrize("sparse_type,precision,backend", FIRST_TWO_PATHS)
-@pytest.mark.parametrize("overlap,hoist,optimize,ready", CONTROL_COMBINATIONS)
+@pytest.mark.parametrize("overlap,hoist,optimize", CONTROL_COMBINATIONS)
 @pytest.mark.parametrize("cp_size,pre_rearranged", [(1, False), (1, True), (2, True)])
 def test_first_two_paths_cover_every_control_and_input_combination(
-    adapter, sparse_type, precision, backend, overlap, hoist, optimize, ready, cp_size, pre_rearranged
+    adapter, sparse_type, precision, backend, overlap, hoist, optimize, cp_size, pre_rearranged
 ):
     adapter.impl.rainfusion.sparse_type = sparse_type
     adapter.impl.rainfusion.precision = precision
@@ -309,7 +306,6 @@ def test_first_two_paths_cover_every_control_and_input_combination(
         overlap_comm=overlap,
         reorder_hoist=hoist,
         optimize_attention_pipeline=optimize,
-        chunk_ready_pipeline=ready,
     )
     adapter.metadata.video_layout = VideoTokenLayout(pre_rearranged=pre_rearranged)
     adapter.plan.used_len = 60 if cp_size == 1 else 251
@@ -332,24 +328,23 @@ def test_first_two_paths_cover_every_control_and_input_combination(
     output = run(adapter, query=q)
     assert output.dtype == q.dtype and torch.equal(output, q + 1)
     state = adapter.states[0]
-    assert (state.overlap_comm, state.optimize_attention_pipeline, state.chunk_ready_pipeline) == (
+    assert (state.overlap_comm, state.optimize_attention_pipeline) == (
         overlap,
         optimize,
-        ready,
     )
     kwargs = adapter.calls[0][-1]
     assert kwargs["precision"] == precision and kwargs["sparse_type"] == sparse_type
     assert kwargs["pre_rearranged"] is pre_rearranged
-    assert kwargs["cp_group"] is (adapter.coordinator.allgather_group if cp_size == 2 else None)
+    assert adapter.states[0].cp_group is (adapter.coordinator.allgather_group if cp_size == 2 else None)
     assert all(
         value.dtype == (torch.float16 if precision == "fp16" else torch.bfloat16) for value in adapter.calls[0][:3]
     )
 
 
 @pytest.mark.parametrize("sparse_type,precision,backend", FIRST_TWO_PATHS)
-@pytest.mark.parametrize("overlap,hoist,optimize,ready", CONTROL_COMBINATIONS)
+@pytest.mark.parametrize("overlap,hoist,optimize", CONTROL_COMBINATIONS)
 def test_first_two_cp_paths_reject_original_order_before_sdk_allocation(
-    adapter, sparse_type, precision, backend, overlap, hoist, optimize, ready
+    adapter, sparse_type, precision, backend, overlap, hoist, optimize
 ):
     adapter.impl.rainfusion.sparse_type = sparse_type
     adapter.impl.rainfusion.precision = precision
@@ -358,7 +353,6 @@ def test_first_two_cp_paths_reject_original_order_before_sdk_allocation(
         overlap_comm=overlap,
         reorder_hoist=hoist,
         optimize_attention_pipeline=optimize,
-        chunk_ready_pipeline=ready,
     )
     adapter.metadata.video_layout = VideoTokenLayout(pre_rearranged=False)
     adapter.coordinator.allgather_world_size = 2
@@ -472,10 +466,10 @@ def test_all_four_paths_can_hoist_the_same_public_rf_plan(adapter, monkeypatch, 
 
 
 @pytest.mark.parametrize("sparse_type,precision,backend", FIRST_TWO_PATHS)
-@pytest.mark.parametrize("overlap,hoist,optimize,ready", CONTROL_COMBINATIONS)
+@pytest.mark.parametrize("overlap,hoist,optimize", CONTROL_COMBINATIONS)
 @pytest.mark.parametrize("already_rearranged", [False, True])
 def test_first_two_hoist_control_matrix_preserves_all_packed_positions(
-    adapter, monkeypatch, sparse_type, precision, backend, overlap, hoist, optimize, ready, already_rearranged
+    adapter, monkeypatch, sparse_type, precision, backend, overlap, hoist, optimize, already_rearranged
 ):
     adapter.impl.rainfusion.sparse_type = sparse_type
     adapter.impl.rainfusion.precision = precision
@@ -484,7 +478,6 @@ def test_first_two_hoist_control_matrix_preserves_all_packed_positions(
         overlap_comm=overlap,
         reorder_hoist=hoist,
         optimize_attention_pipeline=optimize,
-        chunk_ready_pipeline=ready,
     )
     helper = load_module(
         monkeypatch,

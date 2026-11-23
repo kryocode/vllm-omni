@@ -83,7 +83,7 @@ def test_executor_start_uses_local_cpus_and_restores_on_failure(runtime, monkeyp
 
     process.start.side_effect = failed_start
     monkeypatch.setattr(multiproc_executor.current_omni_platform, "is_npu", lambda: True)
-    monkeypatch.setattr(multiproc_executor, "set_multiprocessing_worker_envs", lambda: None)
+    monkeypatch.setattr(multiproc_executor, "set_multiprocessing_worker_envs", lambda **kwargs: None)
     monkeypatch.setattr(multiproc_executor.mp, "set_start_method", lambda *args, **kwargs: None)
     executor = object.__new__(multiproc_executor.MultiprocDiffusionExecutor)
     executor.od_config = cfg

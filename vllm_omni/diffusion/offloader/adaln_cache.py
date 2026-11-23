@@ -79,6 +79,11 @@ class AdaLNWeightCache:
     def prepare(self, modules: Iterable[nn.Module], *, max_gib: float, reserve_gib: float) -> frozenset[int]:
         if self._originals:
             return self.resident_ids
+        if self.device.type == "npu":
+            from vllm_omni.platforms.npu import is_a5
+
+            if is_a5(self.device):
+                return self._fallback("unsupported_on_a5", 0, 0)
         tensors = select_adaln_tensors(modules)
         if not tensors:
             return self._fallback("no_adaln_tensors", 0, 0)

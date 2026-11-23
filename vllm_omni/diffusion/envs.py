@@ -15,13 +15,13 @@ if TYPE_CHECKING:
     MASTER_PORT: int | None = None
     CUDA_HOME: str | None = None
     LOCAL_RANK: int = 0
+    VLLM_OMNI_PACKED_QKV: bool = False
     VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS: str | None = None
     VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS: bool = False
     VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE: int | None = None
 
 environment_variables: dict[str, Callable[[], Any]] = {
-    # ================== Runtime Env Vars ==================
-    # used in distributed environment to determine the master address
+    # ================== Runtime Env Vars ===========    # used in distributed environment to determine the master address
     "MASTER_ADDR": lambda: os.getenv("MASTER_ADDR", ""),
     # used in distributed environment to manually set the communication port
     "MASTER_PORT": lambda: int(os.getenv("MASTER_PORT", "0")) if "MASTER_PORT" in os.environ else None,
@@ -38,6 +38,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE" in os.environ
         else None
     ),
+    # Opt-in portable packed QKV/O exchanges for strict Ulysses. Read
+    # when the attention strategy is constructed; all ranks must agree.
+    "VLLM_OMNI_PACKED_QKV": lambda: os.environ.get("VLLM_OMNI_PACKED_QKV", "0") == "1",
     # Minimum rotary-table span (B*S positions) at which consumers of the shared
     # fused_qk_norm_rope op take the fused path instead of their eager chain;
     # "0" = always fuse; unset = each consumer's own measured default. Raw

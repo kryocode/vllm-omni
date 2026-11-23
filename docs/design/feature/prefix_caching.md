@@ -371,6 +371,14 @@ or in-stage streaming audio) raises `OmniPrefixCacheUnmatchError`. Staging
 depth is raised to `2 * max_concurrent_batches + 1` to cover outputs still in
 flight.
 
+MiniMax-H3 text encoders opt into MRv2 stage-output replay. Their
+`hidden_states.output` and `meta.token_role_ids` are two-dimensional per-token
+payloads: both cached prefix rows and scheduled tail rows must be emitted to the
+DiT stage. They keep `requires_full_prefix_cached_hidden_states=False` because
+the named multimodal hidden-state payload already carries those rows; adding
+the generic `hidden` payload would duplicate them. Native KV-only reuse is
+insufficient for this encoder and would silently drop cached text conditioning.
+
 All of this lives in `MRv2PrefixCacheMixin`
 (`vllm_omni/worker_v2/prefix_cache.py`), which takes the cache lifecycle
 through the runner's `load_model` / `initialize_kv_cache` / `shutdown`
@@ -381,8 +389,7 @@ finished requests, `_prefix_cache_save_mrv2` after postprocess, and
 MiniCPM-o's turn-mode Thinker opts into this output cache. Its `latent`,
 `latent_input_ids` and `latent_positions` are all token-aligned outputs from
 the same forward and must be restored together before the llm2tts bridge
-selects the reply's hidden rows. CUDA turn profiles enable this on both V1
-and MRv2. With a stage-0 `speculative_config` the MRv2 Thinker does not opt
+selects the reply's hidden rows. CUDA turn profiles enable this on MRv2. With a stage-0 `speculative_config` the MRv2 Thinker does not opt
 in and reuses native KV only, since `llm2tts` takes the reply rows from the
 row ledger. MiniCPM-o duplex keeps prefix caching disabled because its mutable
 KV window cannot share cached blocks; the Talker does not opt into output
@@ -521,7 +528,7 @@ Threads, locks, and what each may block on:
 ### Related Files
 
 - `vllm_omni/core/prefix_cache/`
-- `vllm_omni/worker/gpu_model_runner.py` (`_ensure_omni_prefix_cache`)
+- `vllm_omni/core/prefix_cache/runner_mixin.py` (shared cache lifecycle)
 - `vllm_omni/worker_v2/prefix_cache.py` (`MRv2PrefixCacheMixin`, `PrefixCacheRewrite`)
 - `tests/core/test_prefix_cache.py`, `tests/core/test_prefix_cache_mrv2.py`
 - [Async Omni Output Materialization](omni_async_output_materialization.md)
