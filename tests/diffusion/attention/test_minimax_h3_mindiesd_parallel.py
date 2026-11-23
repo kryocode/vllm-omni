@@ -10,6 +10,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni import platforms
+from vllm_omni.diffusion import forward_context
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
 from vllm_omni.diffusion.attention.parallel.ulysses_allgather import UlyssesAllGatherKVParallelAttention
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelResources
@@ -46,14 +48,12 @@ def adapter(monkeypatch):
         return q + 1
 
     platform = SimpleNamespace(is_npu=lambda: True)
-    for name, exports in (
-        ("vllm_omni.diffusion.forward_context", {"get_ulysses_mode": lambda **_: "strict"}),
-        ("vllm_omni.platforms", {"current_omni_platform": platform}),
-        ("mindiesd.parallel", {"ParallelState": new_state, "distributed_sparse_attention": distributed_attention}),
-    ):
-        stub = ModuleType(name)
-        stub.__dict__.update(exports)
-        monkeypatch.setitem(sys.modules, name, stub)
+    monkeypatch.setattr(platforms, "current_omni_platform", platform)
+    monkeypatch.setattr(forward_context, "get_ulysses_mode", lambda **_: "strict")
+    stub = ModuleType("mindiesd.parallel")
+    stub.ParallelState = new_state
+    stub.distributed_sparse_attention = distributed_attention
+    monkeypatch.setitem(sys.modules, stub.__name__, stub)
     module = load_module(monkeypatch, HELPER_NAME, MODEL_DIR / "attention/mindiesd_parallel.py")
     monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(module.dist, "get_world_size", lambda group: 2)
@@ -117,7 +117,11 @@ def run(adapter, *, query=None):
     return adapter.module.try_distributed_sparse_attention(adapter.attention, q, q, q, adapter.metadata)
 
 
-def test_pipeline_call_is_explicit_and_state_is_reused(adapter):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_pipeline_call_is_explicit_and_state_is_reused(adapter, enabled):
+    adapter.impl.rainfusion.parallel = adapter.module.MindIEParallelConfig(
+        overlap_comm=enabled, reorder_hoist=enabled, optimize_attention_pipeline=enabled
+    )
     assert torch.equal(run(adapter), adapter.query + 1)
     run(adapter)
     assert len(adapter.states) == 1
@@ -128,8 +132,8 @@ def test_pipeline_call_is_explicit_and_state_is_reused(adapter):
     assert not {"group", "cp_group"}.intersection(vars(resource))
     state = adapter.states[0]
     assert state.group is adapter.group
-    assert state.overlap_comm is True
-    assert state.optimize_attention_pipeline is True
+    assert state.overlap_comm is enabled
+    assert state.optimize_attention_pipeline is enabled
     assert state.bsa_backend == "eagle"
     q, k, v, spans, kwargs = adapter.calls[0]
     assert q is k is v is adapter.query
@@ -211,7 +215,6 @@ def test_cp_uses_the_existing_orthogonal_group_and_exact_sdk_keywords(
     kwargs = adapter.calls[0][-1]
     assert adapter.states[0].group is adapter.group
     assert adapter.states[0].cp_group is adapter.coordinator.allgather_group
-    assert adapter.states[0].cp_group is adapter.coordinator.allgather_group
     assert not {"kv_gather_group", "comm_dtype", "comm_quant_scope"}.intersection(kwargs)
 
 
@@ -221,17 +224,6 @@ def test_explicit_fp16_attention_restores_the_bf16_producer_dtype(adapter):
     output = run(adapter)
     assert output.dtype == torch.bfloat16
     assert all(value.dtype == torch.float16 for value in adapter.calls[0][:3])
-
-
-def test_pipeline_optimization_switches_are_passed_without_overriding(adapter):
-    adapter.impl.rainfusion.parallel = adapter.module.MindIEParallelConfig(
-        overlap_comm=False,
-        reorder_hoist=False,
-        optimize_attention_pipeline=False,
-    )
-    run(adapter)
-    state = adapter.states[0]
-    assert state.overlap_comm is state.optimize_attention_pipeline is False
 
 
 @pytest.mark.parametrize(
