@@ -1,10 +1,6 @@
 # MiniMax-H3 MindIE-SD parallel attention
 
-MindIE-SD owns Q/K/V prepacking, forward/reverse all-to-all, sparse pooling/mask
-preparation, sparse attention and communication/compute overlap. Omni supplies
-request metadata, admission and state lifetime; admitted calls bypass native
-Ulysses communication. This integration enables parallelism and RF reorder
-hoist. Sparse provider selection follows the four paths below.
+Omni delegates complete parallel attention to MindIE-SD and retains request layout, admission and State lifetime. Enable it with `block_sparse.parallel` using the supported providers below.
 
 ## Requirements and configuration
 
@@ -65,12 +61,6 @@ row permutation while preserving RF order. Sparse step/layer gates still apply.
 
 For mix and native MXFP8, `block_sparse.parallel.quantized_comm` defaults to `false`: Q/K/V communicate in BF16 and are quantized after communication for the selected BSA consumer. Set it to `true` to retain quantized communication (INT8 Q/K and FP8 V for mix; MXFP8 payloads and E8M0 scales for MXFP8). This flag is independent of `precision`, overlap and the B optimizations and must agree across workers.
 
-To select the AICPU communication mode, set
-`VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE=2` before startup. It selects the HCCL
-engine for both Ulysses and AllGather-KV (CP) groups. Both paths therefore use
-AICPU rather than leaving CP on the global default engine. Verify all
-participating ranks' Ulysses and AllGather-KV group logs.
-
 ## Execution and state ownership
 
 Unsupported original-order calls decline before SDK state allocation or
@@ -92,25 +82,41 @@ topology check. Other SDK execution paths are outside this integration.
 
 ## Validation
 
-CPU contracts cover admission, configuration, state reuse/failure/teardown and
-row labels across all four paths. A2/A3 paths require native numerical and
-performance validation; A5-only paths may be qualified by CPU contracts separately
-when A5 hardware is unavailable, without claiming native validation. Native A/B tests must match source, SDK build, model, input,
-precision, sparsity, NFE and cards, with two complete warmups before formal
-timing. Record HTTP/media completion, actual NFE, SDK engagement, Diffuse/E2E
-latency and measured peak memory. CPU tests do not establish native numerics;
-fusion/NZ measurements do not establish this parallel-only path's performance.
+CPU contracts check admission, configuration, lifecycle and row labels; they do not prove native numerics or performance. Match frozen SDK/Omni sources, model, input, precision, sparsity, steps and devices for native comparisons.
 
-## A5 CPU binding
+Exclude recorded warmups, retain all hot samples, and record HTTP/media completion, actual NFE, SDK engagement, synchronized full DiT, E2E and peak memory. CPU or fusion/NZ measurements do not qualify this parallel path. A5 evidence covers U8/CP2×U8; A2/A3 and 32-rank qualification need separate device evidence.
 
-Set `additional_config={"enable_cpu_binding": true}` to bind each NPU worker and
-its threads to permitted CPUs on that device's NUMA node before model loading.
-Use `false` to preserve incoming CPU affinity. The DCMI adapter supports the
-legacy API and the Ascend 950 device-id API, including reordered device visibility.
-This option is independent of sparse precision and does not enable LO.
+## Why the framework boundary is here
 
-AdaLN weight residency caching is not enabled on A5: the cache admission returns
-`unsupported_on_a5` before selecting or allocating tensors. Keep `cache_adaln=false`.
-The existing AdaLN projection-result cache is unchanged. CPU binding support and
-measured latency gains are separate conclusions; qualify each model/topology with
-matching frozen-source hot samples and output comparison.
+Omni creates the sequence-parallel groups and owns their lifetime. Passing those groups to one SDK State preserves stage/rank ordering and avoids constructing a second topology. The SP coordinator reuses that State across layers; it drains the device before releasing SDK buffers and tearing down groups.
+
+The SDK is the complete attention executor: it owns both All-to-All directions, CP exchange, masks, quantization and BSA. Admitted calls bypass ordinary Omni Ulysses exchange, so Q/K/V are communicated once. `precision` selects the BSA; `quantized_comm` independently selects its wire representation.
+
+RF rearrangement stays model-local because MiniMax-H3 owns packed text, image, audio and output positions. Omni relabels these once before sharding when hoist is enabled; the SDK receives tensors and geometry, without acquiring model-specific labels. An RF-reordered request cannot fall back to an executor that does not understand that order; partial collective failures propagate without replay.
+
+## Complete SDK path
+
+```mermaid
+flowchart TD
+    C[block_sparse and parallel configuration] --> P[Omni sequence groups and request metadata]
+    P --> R[Optional request RF plan and modality relabeling]
+    R --> Q[QKV, norm and RoPE; sequence shards]
+    Q --> A{SDK admission}
+    A -->|ordinary input, declined| O[Existing Omni attention]
+    A -->|admitted| S[Coordinator owns ParallelState]
+    A -->|RF input, declined| E[Raise before unaware fallback]
+    S --> F[SD forward All-to-All; CP KV and query-edge exchange]
+    F --> M[RF pools, protected regions and per-head sparse masks]
+    M --> W{Attention precision}
+    W --> V2[rf_v2: BF16 or FP16 RainFusionAttention]
+    W --> V3[rf_v3: BF16 or FP16 Eagle BSA]
+    W --> I8[rf_v3 mix: INT8 QK and FP8 V Eagle QBSA]
+    W --> MX[rf_v3 mxfp8: native CANN mode2 BSA]
+    V2 & V3 & I8 & MX --> B[SD reverse All-to-All and output layout]
+    B --> D[Omni continues DiT and decoding]
+    S --> T[Device drain, State release, group teardown]
+```
+
+With `quantized_comm=true`, mix/MXFP8 are quantized before forward exchange and the consumer reuses their payload/scales. With `false` (default), all exchange is BF16 and quantization occurs at the consumer. Float attention retains its native communication dtype. For 56 heads and U8, both schedules issue seven chunks with three forward and one reverse All-to-All each: 28 calls per layer; CP gathers are counted separately.
+
+All four provider rows support pure strict Ulysses (original/global RF input order) and CP×Ulysses (global RF order required), with serial/overlap and B off/on. Mix/MXFP8 independently accept quantized communication off/on. CP uses U4/U8 with CP2/CP4, complete sequence worlds 8/16/32, batch 1 and D128; pure Ulysses needs an exact head split, and native MXFP8 always requires D128.

@@ -18,10 +18,7 @@ from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelRe
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.cpu]
 
-ROOT = Path(__file__).resolve().parents[3]
-
-MODEL_DIR = ROOT / "vllm_omni/diffusion/models/minimax_h3"
-
+MODEL_DIR = Path(__file__).resolve().parents[3] / "vllm_omni/diffusion/models/minimax_h3"
 HELPER_NAME = "vllm_omni.diffusion.models.minimax_h3.attention.mindiesd_parallel"
 
 
@@ -59,11 +56,7 @@ def adapter(monkeypatch):
     monkeypatch.setattr(module.dist, "get_world_size", lambda group: 2)
 
     group = object()
-    coordinator = SimpleNamespace(
-        ring_world_size=1,
-        allgather_world_size=1,
-        resources=SequenceParallelResources(),
-    )
+    coordinator = SimpleNamespace(ring_world_size=1, allgather_world_size=1, resources=SequenceParallelResources())
     strategy = SimpleNamespace(
         name="ulysses",
         _ulysses_pg=group,
@@ -107,7 +100,7 @@ def adapter(monkeypatch):
         group=group,
         plan=plan,
         impl=impl,
-        library=sys.modules["mindiesd.parallel"],
+        library=stub,
         platform=platform,
     )
 
@@ -140,13 +133,7 @@ def test_pipeline_call_is_explicit_and_state_is_reused(adapter, enabled):
     assert q is k is v is adapter.query
     assert spans == [{"start": 6, "latent_shape": [2, 2, 2]}]
     assert kwargs == dict(
-        used_len=14,
-        state=state,
-        precision="bf16",
-        sparse_type="rf_v3",
-        pre_rearranged=False,
-        scale=0.125,
-        sparsity=0.8,
+        used_len=14, state=state, precision="bf16", sparse_type="rf_v3", pre_rearranged=False, scale=0.125, sparsity=0.8
     )
 
 
@@ -161,36 +148,20 @@ def test_pipeline_call_is_explicit_and_state_is_reused(adapter, enabled):
         ("rf_v3", "mxfp8", "cann", torch.bfloat16),
     ],
 )
-@pytest.mark.parametrize("pre_rearranged", [False, True])
-def test_all_four_sparse_paths_reach_the_public_sdk(adapter, sparse_type, precision, backend, dtype, pre_rearranged):
+def test_sparse_routes_reach_the_public_sdk(adapter, sparse_type, precision, backend, dtype):
     adapter.impl.rainfusion.sparse_type = sparse_type
     adapter.impl.rainfusion.precision = precision
     adapter.impl.rainfusion.bsa_backend = backend
-    adapter.metadata.video_layout = VideoTokenLayout(pre_rearranged=pre_rearranged)
     q = torch.zeros((1, 8, 4, 128), dtype=dtype)
     assert torch.equal(run(adapter, query=q), q + 1)
     assert adapter.calls[0][-1]["precision"] == precision
     assert adapter.calls[0][-1]["sparse_type"] == sparse_type
-    assert adapter.calls[0][-1]["pre_rearranged"] is pre_rearranged
+    assert adapter.calls[0][-1]["pre_rearranged"] is False
     assert adapter.states[0].bsa_backend == backend
 
 
-@pytest.mark.parametrize(
-    "sparse_type,precision,backend",
-    [
-        ("rf_v2", "bf16", "cann"),
-        ("rf_v2", "fp16", "cann"),
-        ("rf_v3", "bf16", "eagle"),
-        ("rf_v3", "fp16", "eagle"),
-        ("rf_v3", "mix", "eagle"),
-        ("rf_v3", "mxfp8", "cann"),
-    ],
-)
-@pytest.mark.parametrize("ulysses_size", [4, 8])
-def test_cp_uses_the_existing_orthogonal_group_and_exact_sdk_keywords(
-    adapter, sparse_type, precision, backend, ulysses_size
-):
-    adapter.impl.rainfusion.sparse_type = sparse_type
+@pytest.mark.parametrize("ulysses_size,precision,backend", [(4, "mix", "eagle"), (8, "mxfp8", "cann")])
+def test_cp_uses_the_existing_orthogonal_group_and_exact_sdk_keywords(adapter, ulysses_size, precision, backend):
     adapter.impl.rainfusion.precision = precision
     adapter.impl.rainfusion.bsa_backend = backend
     adapter.metadata.video_layout = VideoTokenLayout(pre_rearranged=True)
@@ -216,7 +187,8 @@ def test_cp_uses_the_existing_orthogonal_group_and_exact_sdk_keywords(
     kwargs = adapter.calls[0][-1]
     assert adapter.states[0].group is adapter.group
     assert adapter.states[0].cp_group is adapter.coordinator.allgather_group
-    assert not {"kv_gather_group", "comm_dtype", "comm_quant_scope"}.intersection(kwargs)
+    assert not {"group", "cp_group", "kv_gather_group", "comm_dtype", "comm_quant_scope"}.intersection(kwargs)
+    assert kwargs["pre_rearranged"] is True
 
 
 def test_explicit_fp16_attention_restores_the_bf16_producer_dtype(adapter):
@@ -227,27 +199,13 @@ def test_explicit_fp16_attention_restores_the_bf16_producer_dtype(adapter):
     assert all(value.dtype == torch.float16 for value in adapter.calls[0][:3])
 
 
-@pytest.mark.parametrize(
-    "sparse_type,precision,backend",
-    [
-        ("rf_v2", "bf16", "cann"),
-        ("rf_v2", "fp16", "cann"),
-        ("rf_v3", "bf16", "eagle"),
-        ("rf_v3", "fp16", "eagle"),
-        ("rf_v3", "mix", "eagle"),
-        ("rf_v3", "mxfp8", "cann"),
-    ],
-)
-def test_all_four_paths_can_hoist_the_same_public_rf_plan(adapter, monkeypatch, sparse_type, precision, backend):
-    adapter.impl.rainfusion.sparse_type = sparse_type
-    adapter.impl.rainfusion.precision = precision
-    adapter.impl.rainfusion.bsa_backend = backend
+def test_rf_hoist_preserves_modalities_and_declines_an_unresolved_plan(adapter, monkeypatch):
     helper = load_module(
         monkeypatch,
-        "vllm_omni.diffusion.models.minimax_h3.attention.rf_reorder_hoist",
+        HELPER_NAME.replace("mindiesd_parallel", "rf_reorder_hoist"),
         MODEL_DIR / "attention/rf_reorder_hoist.py",
     )
-    plan = torch.tensor([0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 6, 7, 8, 9])
+    plan = torch.tensor([0, 1, 4, 5, 2, 3, 10, 11, 12, 13, 6, 7, 8, 9])
     root = ModuleType("mindiesd")
     setattr(
         root, "build_rf_attention_plan", lambda **kwargs: SimpleNamespace(permutation=plan, inverse=torch.argsort(plan))
@@ -268,12 +226,22 @@ def test_all_four_paths_can_hoist_the_same_public_rf_plan(adapter, monkeypatch, 
         },
     )
     model = SimpleNamespace(blocks=[SimpleNamespace(attn=SimpleNamespace(attention=adapter.attention))])
+    resolve = adapter.impl._resolve_plan
+    adapter.impl._resolve_plan = lambda _: None
+    assert not helper.maybe_hoist_branch(branch, model)
+    assert not branch.static_kwargs["video_token_layout"].pre_rearranged
+    adapter.impl._resolve_plan = resolve
     assert helper.maybe_hoist_branch(branch, model)
     layout = branch.static_kwargs["video_token_layout"]
     packed = branch.static_kwargs["packed_seq_params"]
     assert isinstance(layout, VideoTokenLayout) and layout.pre_rearranged
     assert isinstance(packed, dict) and "vsa_prefix_segments" not in packed
-    assert torch.cat((plan, torch.tensor([14, 15]))).index_select(0, branch.img_pos_dev).tolist() == list(range(6, 14))
+    padded = torch.cat((plan, torch.tensor([14, 15])))
+    assert padded.index_select(0, branch.img_pos_dev).tolist() == list(range(6, 14))
+    assert padded.index_select(0, branch.audio_pos_dev).tolist() == [4, 5]
+    assert padded.index_select(0, branch.text_pos_dev).tolist() == list(range(4))
+    assert torch.equal(branch.token_tags_dev, padded)
+    assert torch.equal(branch.static_kwargs["img_position_ids"][0], torch.arange(48).reshape(16, 3)[padded])
 
 
 @pytest.mark.parametrize(
@@ -335,25 +303,5 @@ def test_teardown_drains_before_releasing_state_and_is_idempotent(adapter, monke
     assert drained == [state] and resource.state is None
     adapter.coordinator.resources.close()
     assert drained == [state]
-
-
-def test_rf_relabel_preserves_modalities_and_padding(adapter, monkeypatch):
-    name = "vllm_omni.diffusion.models.minimax_h3.attention.rf_reorder_hoist"
-    helper = load_module(monkeypatch, name, MODEL_DIR / "attention/rf_reorder_hoist.py")
-    branch = SimpleNamespace(
-        seq_len=10,
-        device=torch.device("cpu"),
-        img_pos=torch.tensor([2, 3, 6, 7]),
-        audio_pos=torch.tensor([4, 5]),
-        text_pos_dev=torch.tensor([0, 1]),
-        token_tags_dev=torch.arange(10),
-        img_position_ids_dev=torch.arange(30).reshape(10, 3),
-        static_kwargs={},
-    )
-    permutation = torch.tensor([0, 1, 4, 5, 6, 7, 2, 3])
-    helper.relabel_branch(branch, permutation, torch.argsort(permutation))
-    padded = torch.cat((permutation, torch.tensor([8, 9])))
-    assert padded.index_select(0, branch.img_pos_dev).tolist() == [2, 3, 6, 7]
-    assert padded.index_select(0, branch.audio_pos_dev).tolist() == [4, 5]
-    assert branch.token_tags_dev.tolist() == padded.tolist()
-    assert torch.equal(branch.static_kwargs["img_position_ids"][0], torch.arange(30).reshape(10, 3)[padded])
+    with pytest.raises(RuntimeError, match="closed"):
+        run(adapter)

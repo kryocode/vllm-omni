@@ -69,7 +69,7 @@ def _npu_affinity(index: int) -> tuple[int, int, set[int]]:
             raise RuntimeError("DCMI initialization failed")
         phy_from_logic = lib.dcmiv2_get_chip_phy_id_by_dev_id
         logic_from_phy = lib.dcmiv2_get_dev_id_by_chip_phy_id
-        id_type = ctypes.c_int
+        id_type: type[ctypes.c_int] | type[ctypes.c_uint] = ctypes.c_int
     else:
         phy_from_logic = lib.dcmi_get_device_phyid_from_logicid
         logic_from_phy = lib.dcmi_get_device_logicid_from_phyid

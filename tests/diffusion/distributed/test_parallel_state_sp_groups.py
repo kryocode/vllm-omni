@@ -182,7 +182,7 @@ def test_set_seq_parallel_pg_builds_orthogonal_ulysses_allgather_groups(
 
 @pytest.mark.parametrize("mode,npu", [(1, True), (2, False)])
 def test_invalid_hccl_mode_rejects_before_creating_groups(monkeypatch, mode, npu):
-    created = []
+    created: list[SimpleNamespace] = []
     monkeypatch.setattr(torch.distributed, "new_group", _fake_new_group_factory(created))
     monkeypatch.setattr(omni_parallel_state.envs, "VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE", mode)
     monkeypatch.setattr(omni_parallel_state.current_omni_platform, "is_npu", lambda: npu)

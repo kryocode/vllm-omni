@@ -42,7 +42,7 @@ vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --diffusion-offload-config '{"mode":"layer","components":["dit"]}'
 ```
 
-## Optional AdaLN cache and NPU CPU binding
+## Optional AdaLN cache
 
 Ordinary DiT layerwise offload supports `--cache-adaln` (default off),
 `--adaln-cache-max-gib` (25 GiB per device) and `--adaln-cache-reserve-gib`
@@ -61,23 +61,6 @@ startup check; it does not bound future activation/VAE memory. MiniMax-H3's
 non-block final projection weight and scale retain their existing residency.
 Selection, rollback and hook exclusion are specified in the
 [layerwise offload design](../../../design/feature/offloader/layerwise_offload.md).
-
-On NPU, `additional_config={"enable_cpu_binding": true}` requires worker
-and thread affinity within the device's NUMA CPUs and incoming CPU limits;
-`false` preserves incoming affinity. When omitted, automatic binding applies
-only to LO with AdaLN caching and MindIE-SD CP2×U8 on 16 devices. Automatic
-failure preserves affinity; explicit `true` reports failure. Binding is
-independent of enabling the cache and remains available on A5.
-
-```bash
-vllm serve /path/to/model --omni \
-  --additional-config '{"enable_cpu_binding":true}'
-```
-
-Local spawned workers inherit locality before Torch imports; the launching
-thread restores its affinity after startup. Worker initialization and loading
-also bind existing thread pools. No IRQ affinity or process-wide page migration
-is performed. See the design above for lifecycle details.
 
 ## Component selection
 
@@ -146,3 +129,30 @@ offload consume the same `OffloadPlan` metadata.
 - Setup consolidates and pins block parameters, increasing cold-start time.
 - Performance depends on block compute time and host-to-device bandwidth;
   lightweight blocks may not hide transfers.
+
+## NPU CPU binding
+
+Set `additional_config={"enable_cpu_binding": true}` to bind each NPU worker
+and its existing threads to permitted CPUs on its device's PCIe NUMA node.
+`false` preserves incoming affinity; explicit `true` reports binding failure.
+The DCMI adapter supports both legacy and Ascend 950 APIs and reordered device
+visibility. Binding is independent of sparse precision and does not enable LO.
+
+```bash
+vllm serve /path/to/model --omni \
+  --additional-config '{"enable_cpu_binding":true}'
+```
+
+Local spawned workers inherit locality before Torch imports; the launching
+thread restores its affinity after startup, including failed starts. Worker
+initialization and loading bind existing thread pools within their individual
+CPU limits. IRQ affinity and process-wide page migration are unchanged.
+When omitted, the automatic policy applies only if an optional AdaLN cache is
+enabled for MindIE-SD CP2×U8 on 16 devices; failure then preserves affinity.
+A5 uses explicit binding with LO and AdaLN residency disabled.
+
+Set `VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE=2` (AICPU) or `3` (AIV) before
+startup to choose the engine for both Ulysses and AllGather-KV groups.
+Omitting it preserves the HCCL default. Check participating group logs to
+confirm the selected engine. CPU binding support does not establish a latency
+gain; qualify each model/topology with frozen-source hot samples.

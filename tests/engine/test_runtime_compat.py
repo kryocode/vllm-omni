@@ -137,3 +137,21 @@ def test_text_prefix_and_role_labels_replace_the_scheduled_tail():
     assert torch.equal(tail["hidden_states.output"], full)
     assert torch.equal(tail["meta.token_role_ids"], tags)
     assert output.full_payload_prefix_cache_keys["request"] == frozenset(tail)
+
+
+def test_nonmember_encoder_rank_joins_creation_without_coordinator(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+
+    pipeline = object.__new__(pipeline_module.MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline._dit_rank = 12
+    calls = []
+    monkeypatch.setattr(torch.distributed, "new_group", lambda ranks, **kw: calls.append((ranks, kw["backend"])))
+
+    def reject_nonmember(**kwargs):
+        pytest.fail("a rank outside encoder TP must not construct its coordinator")
+
+    monkeypatch.setattr(pipeline_module, "init_world_group", reject_nonmember)
+    group = pipeline._build_text_encoder_group(8)
+    assert calls == [(list(range(8)), pipeline_module.current_omni_platform.dist_backend), (list(range(8)), "gloo")]
+    assert group.world_size == 1
