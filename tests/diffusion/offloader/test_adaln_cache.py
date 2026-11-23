@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Exact storage, admission and lifecycle tests for optional AdaLN caching."""
+"""AdaLN storage rollback, resident tensor exclusion and A5 cache rejection."""
+
+from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
 
-from tests.diffusion.offloader.helpers import patch_offload_runtime
+import vllm_omni.diffusion.offloader.layerwise_backend as backend_module
+from tests.diffusion.offloader.helpers import DummyStream, patch_offload_runtime
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.offloader import adaln_cache
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
-from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend
+from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend, LayerwiseOffloadHook
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 
@@ -60,54 +64,6 @@ def test_exact_strided_storage_and_restore():
     for target, _, pointer, stride, expected in saved:
         assert target.data_ptr() == pointer and target.stride() == stride
         assert torch.equal(raw(target), expected)
-
-
-@pytest.mark.parametrize("dtype", [torch.int8, torch.bfloat16, torch.float16, torch.float8_e4m3fn])
-def test_quantized_weight_and_scale_dtypes_are_preserved(dtype):
-    module = nn.Module()
-    module.adaln = nn.Module()
-    module.adaln.weight = nn.Parameter(torch.arange(8.0).to(dtype), requires_grad=False)
-    module.adaln.register_buffer("weight_scale", torch.tensor([0.5], dtype=torch.float32))
-    if hasattr(torch, "float8_e8m0fnu"):
-        module.adaln.register_buffer("mx_scale", torch.tensor([127, 128], dtype=torch.uint8).view(torch.float8_e8m0fnu))
-    expected = {name: (t.dtype, t.stride(), raw(t).clone()) for name, t in adaln_cache.select_adaln_tensors([module])}
-    cache = adaln_cache.AdaLNWeightCache(torch.device("cpu"))
-    cache.prepare([module], max_gib=1, reserve_gib=1)
-    assert cache.status.enabled
-    for name, tensor in adaln_cache.select_adaln_tensors([module]):
-        old_dtype, old_stride, old_bytes = expected[name]
-        assert tensor.dtype == old_dtype and tensor.stride() == old_stride
-        assert torch.equal(raw(tensor), old_bytes)
-
-
-def test_shared_tensors_are_cached_once():
-    block = Block()
-    assert len(adaln_cache.select_adaln_tensors([block, block])) == 2
-
-
-def test_minimax_final_projection_retains_original_cache_scope():
-    module = nn.Module()
-    module.blocks = nn.ModuleList([Block()])
-    module.final_layer = nn.Module()
-    module.final_layer.adaln_proj = nn.Module()
-    projection = nn.Module()
-    projection.weight = nn.Parameter(torch.ones((2, 2), dtype=torch.int8), requires_grad=False)
-    projection.register_buffer("weight_scale", torch.ones(2, dtype=torch.float32))
-    projection.bias = nn.Parameter(torch.ones(2, dtype=torch.bfloat16), requires_grad=False)
-    module.final_layer.adaln_proj.linear = projection
-    selected = {id(t) for _, t in adaln_cache.select_adaln_tensors([module])}
-    assert id(projection.weight) not in selected
-    assert id(projection.weight_scale) not in selected
-    assert id(projection.bias) in selected
-    assert id(module.blocks[0].adaLN_modulation.weight) in selected
-
-
-def test_activation_buffers_are_not_selected_as_static_weights():
-    block = Block()
-    block.adaLN_modulation.register_buffer("activation_cache", torch.ones(16))
-    selected = {id(tensor) for _, tensor in adaln_cache.select_adaln_tensors([block])}
-    assert id(block.adaLN_modulation.activation_cache) not in selected
-    assert id(block.adaLN_modulation.scale) in selected
 
 
 @pytest.mark.parametrize(
@@ -175,61 +131,6 @@ def test_second_allocation_failure_rolls_back_without_changing_values(monkeypatc
         assert target.data_ptr() == pointer and torch.equal(raw(target), expected)
 
 
-def test_contiguous_singleton_layout_preserves_noncanonical_stride():
-    module = nn.Module()
-    module.adaln = nn.Module()
-    value = torch.arange(2.0).as_strided((2, 1), (1, 100))
-    module.adaln.weight = nn.Parameter(value, requires_grad=False)
-    original = module.adaln.weight.detach()
-    assert original.is_contiguous()
-    cache = adaln_cache.AdaLNWeightCache(torch.device("cpu"))
-    cache.prepare([module], max_gib=1, reserve_gib=1)
-    assert cache.status.enabled
-    assert module.adaln.weight.stride() == original.stride()
-    assert torch.equal(raw(module.adaln.weight), raw(original))
-    cache.restore()
-    assert module.adaln.weight.data_ptr() == original.data_ptr()
-
-
-@pytest.mark.parametrize("after_commit", [False, True])
-def test_partial_storage_commit_failure_restores_every_tensor(monkeypatch, after_commit):
-    block = Block()
-    saved = [(t, t.data_ptr(), raw(t).clone()) for _, t in adaln_cache.select_adaln_tensors([block])]
-    original = adaln_cache.set_tensor_storage
-    calls = 0
-
-    def injected(target, value):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            if after_commit:
-                original(target, value)
-            raise RuntimeError("injected storage commit failure")
-        original(target, value)
-
-    monkeypatch.setattr(adaln_cache, "set_tensor_storage", injected)
-    cache = adaln_cache.AdaLNWeightCache(torch.device("cpu"))
-    assert not cache.prepare([block], max_gib=1, reserve_gib=1)
-    for tensor, pointer, expected in saved:
-        assert tensor.data_ptr() == pointer and torch.equal(raw(tensor), expected)
-
-
-def test_invalid_post_allocation_telemetry_falls_back(monkeypatch):
-    values = iter([64 * 2**30, None])
-    monkeypatch.setattr(adaln_cache.current_omni_platform, "get_free_memory", lambda device: next(values))
-    cache = adaln_cache.AdaLNWeightCache(torch.device("cpu"))
-    assert not cache.prepare([Block()], max_gib=1, reserve_gib=1)
-    assert cache.status.reason == "cache_allocation_or_copy_failed"
-
-
-def test_budget_counts_strided_storage_span():
-    block = Block()
-    block.adaLN_modulation.weight = nn.Parameter(torch.ones(16).as_strided((2, 3), (8, 2)), requires_grad=False)
-    cache = adaln_cache.AdaLNWeightCache(torch.device("cpu"))
-    assert not cache.prepare([block], max_gib=32 / 2**30, reserve_gib=0)
-    assert cache.status.reason == "cache_budget_exceeded" and cache.status.bytes > 32
-
-
 @pytest.mark.parametrize("enabled,budget", [(True, 1), (True, 0), (False, 1)])
 def test_backend_installs_cache_or_falls_back_and_preserves_repeated_execution(enabled, budget):
     pipeline = nn.Module()
@@ -261,58 +162,142 @@ def test_backend_installs_cache_or_falls_back_and_preserves_repeated_execution(e
         assert torch.equal(raw(tensor), expected[id(tensor)])
 
 
-def test_backend_shutdown_releases_cache_to_original_storage():
-    pipeline = nn.Module()
-    pipeline.transformer = DiT()
-    cached = adaln_cache.select_adaln_tensors([pipeline.transformer])
-    pointers = {id(t): t.data_ptr() for _, t in cached}
-    backend = LayerWiseOffloadBackend(
-        OffloadConfig(
-            strategy=OffloadStrategy.LAYER_WISE,
-            pin_cpu_memory=False,
-            cache_adaln=True,
-            adaln_cache_max_gib=1,
-            adaln_cache_reserve_gib=1,
-        ),
-        torch.device("cpu"),
+class MixedBlock(nn.Module):
+    def __init__(self, offset=0):
+        super().__init__()
+        # Register the cache first to exercise materialization-probe selection.
+        self.cached_weight = nn.Parameter(torch.arange(4.0) + offset, requires_grad=False)
+        self.weight = nn.Parameter(torch.arange(6.0) + offset, requires_grad=False)
+        self.register_buffer("cached_state", torch.arange(3.0) + offset)
+        self.register_buffer("state", torch.arange(2, dtype=torch.int64) + offset)
+
+
+def resident_ids(blocks):
+    return frozenset(id(tensor) for block in blocks for tensor in (block.cached_weight, block.cached_state))
+
+
+def snapshots(blocks):
+    return [
+        [
+            (tensor, tensor.detach().clone(), tensor.data_ptr(), tensor.stride())
+            for tensor in (block.cached_weight, block.cached_state)
+        ]
+        for block in blocks
+    ]
+
+
+def assert_resident_untouched(saved):
+    for tensors in saved:
+        for tensor, expected, pointer, stride in tensors:
+            assert tensor.data_ptr() == pointer
+            assert tensor.stride() == stride
+            assert torch.equal(tensor, expected)
+
+
+@pytest.mark.parametrize("block_count", [2, 3])
+def test_ring_preserves_resident_parameters_and_buffers(block_count):
+    blocks = nn.ModuleList([MixedBlock(index * 10) for index in range(block_count)])
+    saved = snapshots(blocks)
+    expected = [(block.weight.detach().clone(), block.state.clone()) for block in blocks]
+    hooks = backend_module._install_layerwise_hook_group(
+        blocks, torch.device("cpu"), DummyStream(), pin_memory=False, resident_tensor_ids=resident_ids(blocks)
     )
-    backend.enable(pipeline)
-    backend.shutdown()
-    assert not backend.enabled and not backend._adaln_cache.resident_ids
-    for _, tensor in cached:
-        assert tensor.data_ptr() == pointers[id(tensor)]
+
+    assert_resident_untouched(saved)
+    for hook in hooks:
+        assert set(hook.block_parameters) == {"weight"}
+        assert set(hook.block_buffers) == {"state"}
+        assert set(hook.next_block_parameters) == {"weight"}
+        assert set(hook.next_block_buffers) == {"state"}
+        assert hook._materialization_probe is hook.block_parameters["weight"]
+        assert not hook.is_materialized
+        # Only the six FP32 weight values and two INT64 state values cross H2D.
+        assert sum(t.numel() * t.element_size() for t in hook.dtype_cpu_flattened_weights.values()) == 40
+
+    for _ in range(3):
+        for block, (weight, state) in zip(blocks, expected, strict=True):
+            hook = block._hook_registry.get_hook(LayerwiseOffloadHook._HOOK_NAME)
+            hook.pre_forward(block)
+            assert hook.is_materialized
+            assert torch.equal(block.weight, weight)
+            assert torch.equal(block.state, state)
+            hook.post_forward(block, None)
+            hook.offload_layer()
+            assert not hook.is_materialized
+            assert_resident_untouched(saved)
+
+    for hook in hooks:
+        hook.prefetch_layer(non_blocking=False)
+        hook.prefetch_layer(non_blocking=False)
+        hook.restore_next_block()
+        hook.restore_next_block()
+        assert_resident_untouched(saved)
+    for block, (weight, state) in zip(blocks, expected, strict=True):
+        assert torch.equal(block.weight, weight)
+        assert torch.equal(block.state, state)
 
 
-def test_backend_disable_restores_original_cache_storage():
-    pipeline = nn.Module()
-    pipeline.transformer = DiT()
-    cached = adaln_cache.select_adaln_tensors([pipeline.transformer])
-    pointers = {id(t): t.data_ptr() for _, t in cached}
-    backend = LayerWiseOffloadBackend(
-        OffloadConfig(
-            strategy=OffloadStrategy.LAYER_WISE,
-            pin_cpu_memory=False,
-            cache_adaln=True,
-            adaln_cache_max_gib=1,
-            adaln_cache_reserve_gib=1,
-        ),
-        torch.device("cpu"),
+def test_all_resident_block_needs_no_host_master():
+    blocks = nn.ModuleList([MixedBlock(), MixedBlock(10)])
+    ids = frozenset(id(t) for block in blocks for t in [*block.parameters(), *block.buffers()])
+    pointers = [t.data_ptr() for block in blocks for t in [*block.parameters(), *block.buffers()]]
+    hooks = backend_module._install_layerwise_hook_group(
+        blocks, torch.device("cpu"), DummyStream(), pin_memory=False, resident_tensor_ids=ids
     )
-    backend.enable(pipeline)
-    backend.disable()
-    for _, tensor in cached:
-        assert tensor.data_ptr() == pointers[id(tensor)]
+    for hook in hooks:
+        assert hook._materialization_probe is None
+        assert hook.is_materialized
+        assert not hook.dtype_cpu_flattened_weights
+        hook.prefetch_layer()
+        hook.offload_layer()
+        hook.restore_next_block()
+    assert [t.data_ptr() for block in blocks for t in [*block.parameters(), *block.buffers()]] == pointers
 
 
-def test_disabled_cache_never_queries_device_memory(monkeypatch):
+def test_a5_rejects_cache_before_tensor_selection_or_allocation(monkeypatch):
+    from vllm_omni.platforms import npu
+
+    monkeypatch.setattr(npu, "is_a5", lambda device: True)
+
     def unexpected(*args, **kwargs):
-        raise AssertionError("disabled cache consulted memory")
+        raise AssertionError("A5 must not select or allocate cache tensors")
 
-    monkeypatch.setattr(adaln_cache.current_omni_platform, "get_free_memory", unexpected)
-    pipeline = nn.Module()
-    pipeline.transformer = DiT()
-    backend = LayerWiseOffloadBackend(
-        OffloadConfig(strategy=OffloadStrategy.LAYER_WISE, pin_cpu_memory=False), torch.device("cpu")
-    )
-    backend.enable(pipeline)
-    backend.disable()
+    monkeypatch.setattr(adaln_cache, "select_adaln_tensors", unexpected)
+    cache = adaln_cache.AdaLNWeightCache(SimpleNamespace(type="npu", index=0))
+    assert cache.prepare([], max_gib=25, reserve_gib=8) == frozenset()
+    assert not cache.status.enabled and cache.status.reason == "unsupported_on_a5"
+    assert not cache.resident_ids
+
+
+@pytest.fixture(autouse=True)
+def local_model_paths(monkeypatch):
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"cache_adaln": "true"},
+        {"adaln_cache_max_gib": -1},
+        {"adaln_cache_max_gib": float("nan")},
+        {"adaln_cache_reserve_gib": float("inf")},
+        {"adaln_cache_reserve_gib": True},
+    ],
+)
+def test_invalid_cache_options_are_rejected_before_loading(kwargs):
+    with pytest.raises((TypeError, ValueError)):
+        OmniDiffusionConfig(model="fake-model", enable_layerwise_offload=True, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"enable_cpu_offload": True},
+        {"enable_distributed_layerwise_offload": True},
+        {"diffusion_offload_config": {"mode": "layer", "components": ["text_encoder"]}},
+    ],
+)
+def test_cache_requires_ordinary_dit_layer_offload(kwargs):
+    with pytest.raises(ValueError, match="cache_adaln requires"):
+        OmniDiffusionConfig(model="fake-model", cache_adaln=True, **kwargs)

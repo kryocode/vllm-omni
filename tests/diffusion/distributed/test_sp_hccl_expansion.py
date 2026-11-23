@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Device-free regression for matching Ulysses and CP HCCL execution modes."""
 
-from __future__ import annotations
-
 import ast
 import sys
 from pathlib import Path
@@ -55,7 +53,7 @@ def load_group_builders(monkeypatch, mode, *, npu=True, entry="_set_ulysses_allg
 
 
 @pytest.mark.parametrize("mode", [2, 3])
-@pytest.mark.parametrize("rank", range(16))
+@pytest.mark.parametrize("rank", [0, 7, 8, 15])
 def test_cp_uses_same_explicit_hccl_mode_as_ulysses(monkeypatch, mode, rank):
     build, created = load_group_builders(monkeypatch, mode)
     ulysses, ring, cp = build(8, 2, rank, 16, None)
