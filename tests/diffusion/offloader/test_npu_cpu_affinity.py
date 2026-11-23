@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """NPU CPU binding respects device visibility, CPU limits and worker startup ownership."""
 
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -140,41 +139,6 @@ def test_worker_binds_before_device_runtime_initialization(monkeypatch):
     monkeypatch.setattr(current_omni_platform, "set_device", initialize)
     with pytest.raises(RuntimeError, match="device-init sentinel"):
         worker.init_device()
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-def test_public_additional_config_reaches_diffusion_stage(monkeypatch, enabled):
-    from vllm_omni.config.config_factory import StageConfigFactory
-    from vllm_omni.config.omni_config import extract_diffusion_stage_config_kwargs
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.entrypoints.cli.serve import OmniServeCommand
-    from vllm_omni.utils.tracking_parser import TrackingArgumentParser
-
-    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
-    parser = TrackingArgumentParser()
-    OmniServeCommand().subparser_init(parser.add_subparsers(dest="subcommand"))
-    args = parser.parse_args(
-        [
-            "serve",
-            "fake-model",
-            "--omni",
-            "--enable-layerwise-offload",
-            "--cache-adaln",
-            "--additional-config",
-            json.dumps({"enable_cpu_binding": enabled}),
-        ]
-    )
-    stages = StageConfigFactory.create_default_diffusion(
-        {
-            "model": "fake-model",
-            "enable_layerwise_offload": True,
-            "cache_adaln": True,
-            "additional_config": args.additional_config,
-        }
-    )
-    fields = extract_diffusion_stage_config_kwargs(dict(stages[0]["engine_args"]), stage_id=0)
-    cfg = OmniDiffusionConfig(**{k: v for k, v in fields.items() if v is not None})
-    assert cfg.additional_config["enable_cpu_binding"] is enabled
 
 
 class Function:

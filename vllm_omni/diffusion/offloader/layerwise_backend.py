@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from itertools import chain
-from typing import Any, Protocol
+from typing import Any, TypeVar
 
 import torch
 from torch import nn
@@ -39,20 +39,11 @@ from .tensor_utils import (
 logger = init_logger(__name__)
 
 
-class OffloadEvent(Protocol):
-    """Operations used from device-specific offload events."""
-
-    def record(self, stream: OffloadStream) -> None: ...
-
-    def synchronize(self) -> None: ...
+TensorT = TypeVar("TensorT", bound=torch.Tensor)
 
 
-class OffloadStream(Protocol):
-    """Common stream operations across the supported accelerator backends."""
-
-    def wait_stream(self, stream: OffloadStream) -> None: ...
-
-    def wait_event(self, event: OffloadEvent) -> None: ...
+def _streamed_tensors(tensors: Iterable[tuple[str, TensorT]], resident_ids: frozenset[int]) -> dict[str, TensorT]:
+    return {name: tensor for name, tensor in tensors if id(tensor) not in resident_ids}
 
 
 class LayerwiseOffloadHook(ModelHook):
@@ -75,7 +66,7 @@ class LayerwiseOffloadHook(ModelHook):
         self,
         next_block: nn.Module,
         device: torch.device,
-        stream: OffloadStream | None = None,
+        stream: current_omni_platform.Stream | None = None,
         pin_memory: bool = True,
         materialization_probe_tensor: torch.Tensor | None = None,
         resident_tensor_ids: frozenset[int] | None = None,
@@ -91,7 +82,7 @@ class LayerwiseOffloadHook(ModelHook):
         self.resident_tensor_ids = resident_tensor_ids or frozenset()
 
         # Per-block synchronization primitive: set after H2D copy completes.
-        self._prefetch_done: OffloadEvent | None = None
+        self._prefetch_done: current_omni_platform.Event | None = None
 
         # Backward link to the hook that is responsible for prefetching *this* block's weights
         self._prev_hook: LayerwiseOffloadHook | None = None
@@ -107,25 +98,13 @@ class LayerwiseOffloadHook(ModelHook):
         # the input module is kept intact
         module = super().initialize_hook(module)
 
-        self.block_parameters: dict[str, nn.Parameter] = {
-            name: tensor for name, tensor in module.named_parameters() if id(tensor) not in self.resident_tensor_ids
-        }
-        self.block_buffers: dict[str, torch.Tensor] = {
-            name: tensor for name, tensor in module.named_buffers() if id(tensor) not in self.resident_tensor_ids
-        }
+        self.block_parameters = _streamed_tensors(module.named_parameters(), self.resident_tensor_ids)
+        self.block_buffers = _streamed_tensors(module.named_buffers(), self.resident_tensor_ids)
         if self._materialization_probe is None or id(self._materialization_probe) in self.resident_tensor_ids:
             self._materialization_probe = materialization_probe(self.block_parameters, self.block_buffers)
 
-        self.next_block_parameters = {
-            name: tensor
-            for name, tensor in self.next_block.named_parameters()
-            if id(tensor) not in self.resident_tensor_ids
-        }
-        self.next_block_buffers = {
-            name: tensor
-            for name, tensor in self.next_block.named_buffers()
-            if id(tensor) not in self.resident_tensor_ids
-        }
+        self.next_block_parameters = _streamed_tensors(self.next_block.named_parameters(), self.resident_tensor_ids)
+        self.next_block_buffers = _streamed_tensors(self.next_block.named_buffers(), self.resident_tensor_ids)
 
         # Pre-allocate gpu tensors in a flattened way
         self.dtype_cpu_flattened_weights, self.dtype_metadata = LayerwiseOffloadHook._to_cpu(
@@ -278,7 +257,7 @@ def apply_block_hook(
     module: nn.Module,
     next_block: nn.Module,
     device: torch.device,
-    stream: OffloadStream | None = None,
+    stream: current_omni_platform.Stream | None = None,
     pin_memory: bool = True,
     *,
     materialization_probe_tensor: torch.Tensor | None = None,
@@ -369,7 +348,7 @@ def enable_plan_encoder_layerwise_offload(
     component: ResolvedComponent,
     *,
     device: torch.device,
-    stream: OffloadStream,
+    stream: current_omni_platform.Stream,
     pin_memory: bool,
 ) -> bool:
     """Apply rank-local layerwise hooks to the encoder's resolved stacks."""

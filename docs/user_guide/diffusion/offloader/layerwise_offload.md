@@ -42,90 +42,42 @@ vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --diffusion-offload-config '{"mode":"layer","components":["dit"]}'
 ```
 
-## Optional AdaLN weight cache
+## Optional AdaLN cache and NPU CPU binding
 
-`--cache-adaln` keeps the loaded DiT tensors in AdaLN-named modules on the
-device while ordinary layerwise offload continues to stream other weights.
-It is disabled by default. Use `--no-cache-adaln` to explicitly disable it.
-The same Python/stage-config fields are `cache_adaln`,
-`adaln_cache_max_gib`, and `adaln_cache_reserve_gib`.
+Ordinary DiT layerwise offload supports `--cache-adaln` (default off),
+`--adaln-cache-max-gib` (25 GiB per device) and `--adaln-cache-reserve-gib`
+(8 GiB free after allocation). Python/stage fields use the corresponding
+underscore names. Model offload, distributed LO and encoder-only selections
+reject the cache option. A5 rejects cache admission before allocation.
 
 ```bash
 vllm serve /path/to/model --omni --enable-layerwise-offload \
   --cache-adaln --adaln-cache-max-gib 25 --adaln-cache-reserve-gib 8
-
-vllm serve /path/to/model --omni --enable-layerwise-offload --no-cache-adaln
 ```
 
-It also works with `--diffusion-offload-config
-'{"mode":"layer","components":["dit"]}'`. Model-level offload, distributed
-layerwise offload, and an encoder-only offload selection reject this option.
+Cached AdaLN weights and scales retain their loaded dtype/stride. Budget,
+telemetry or copy failures leave ordinary LO available. The reserve is a
+startup check; it does not bound future activation/VAE memory. MiniMax-H3's
+non-block final projection weight and scale retain their existing residency.
+Selection, rollback and hook exclusion are specified in the
+[layerwise offload design](../../../design/feature/offloader/layerwise_offload.md).
 
-The per-device cache limit defaults to 25 GiB. Admission also requires at
-least 8 GiB free after allocation, configurable with
-`--adaln-cache-reserve-gib`. Exceeding a limit, unavailable memory telemetry,
-unsupported tensors, or cache allocation/copy failure leaves ordinary LO
-active. Logs state whether caching was enabled and the fallback reason.
-The reserve is a startup admission check, not an upper bound on future
-activation or VAE memory; choose it for the workload and disable the cache
-when additional headroom is needed.
-
-Weights, biases, and quantization buffers/scales retain their loaded dtype and
-stride. The cache policy is independent of attention precision. MiniMax-H3's
-RF-v2 BF16/FP16 and RF-v3 BF16/FP16, `mix` (A5 Eagle QBSA), and `mxfp8` (A5
-CANN) accept the same policy. INT8/FP8 weights and E8M0 scale storage are not
-converted to BF16. A5 still requires its attention runtime and operators;
-CPU config/storage checks do not establish A5 device precision, memory
-capacity, or performance acceptance.
-
-MiniMax-H3 keeps its original 101-tensor cache scope for the current INT8
-checkpoint. The final AdaLN projection's `linear.weight` and `weight_scale`
-already remain on device outside the streamed blocks and are excluded from
-this cache; its BF16 bias remains included. Quantized AdaLN weights and scales
-inside transformer blocks continue to retain their loaded representations.
-
-This option caches AdaLN only; it does not enable the retired additional
-MLP fc1 cache or per-request weight staging experiment.
-
-## NPU CPU locality
-
-For the MindIE-SD 16-device Ulysses-8 x CP-2 path, with NPU layerwise offload
-and `cache_adaln` enabled, the loader automatically limits the worker's CPU
-affinity to allowed CPUs on the target NPU's NUMA node before loading weights.
-The worker applies this before device/distributed initialization and the
-loader checks again before weights are allocated. Existing thread pools are
-included, and newly created threads inherit their creator's CPU affinity.
-Native Omni and SD8 keep their incoming affinity by default.
-This helps host allocation and weight-transfer locality
-when DiT compute becomes too short to hide H2D transfers. Physical device
-visibility and PCIe topology determine the node; affinity never expands beyond
-the incoming CPU allowance. Tensor dtype, layout, cache size and CPU recovery
-are unchanged.
-
-Use the existing public `additional_config` option to override this policy:
+On NPU, `additional_config={"enable_cpu_binding": true}` requires worker
+and thread affinity within the device's NUMA CPUs and incoming CPU limits;
+`false` preserves incoming affinity. When omitted, automatic binding applies
+only to LO with AdaLN caching and MindIE-SD CP2×U8 on 16 devices. Automatic
+failure preserves affinity; explicit `true` reports failure. Binding is
+independent of enabling the cache and remains available on A5.
 
 ```bash
-# Preserve the worker's incoming CPU affinity.
-vllm serve /path/to/model --omni --enable-layerwise-offload --cache-adaln \
-  --additional-config '{"enable_cpu_binding":false}'
-
-# Require successful NPU CPU binding.
-vllm serve /path/to/model --omni --enable-layerwise-offload --cache-adaln \
+vllm serve /path/to/model --omni \
   --additional-config '{"enable_cpu_binding":true}'
 ```
 
-The Python/stage-config equivalent is
-`additional_config={"enable_cpu_binding": False}` or `True`. The automatic
-policy preserves incoming affinity if topology or permitted local CPUs are
-unavailable; explicit `True` reports a binding failure. Binding only affects
-eligible threads in the current worker process and does not migrate process-wide NUMA pages or
-change device IRQ affinity.
-
-For the local multiprocessing executor, each new worker inherits its local CPU
-allowance before Python imports Torch. The launching thread temporarily adopts
-that allowance only for process startup and then restores its original CPUs.
-Direct in-process loading and Ray workers retain the later initialization and
-loading checks; this startup guarantee applies to local spawned workers.
+Local spawned workers inherit locality before Torch imports; the launching
+thread restores its affinity after startup. Worker initialization and loading
+also bind existing thread pools. No IRQ affinity or process-wide page migration
+is performed. See the design above for lifecycle details.
 
 ## Component selection
 

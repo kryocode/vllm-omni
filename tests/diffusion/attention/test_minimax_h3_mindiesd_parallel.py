@@ -4,7 +4,6 @@
 
 import importlib.util
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -22,42 +21,6 @@ ROOT = Path(__file__).resolve().parents[3]
 MODEL_DIR = ROOT / "vllm_omni/diffusion/models/minimax_h3"
 
 HELPER_NAME = "vllm_omni.diffusion.models.minimax_h3.attention.mindiesd_parallel"
-
-
-@dataclass
-class HoistAttention:
-    attention: object
-
-
-@dataclass
-class HoistBlock:
-    attn: HoistAttention
-
-
-@dataclass
-class HoistModel:
-    blocks: list[HoistBlock]
-
-
-@dataclass
-class HoistBranch:
-    seq_len: int
-    used_len: int
-    device: torch.device
-    img_pos: torch.Tensor
-    audio_pos: torch.Tensor
-    text_pos_dev: torch.Tensor
-    token_tags_dev: torch.Tensor
-    img_position_ids_dev: torch.Tensor
-    static_kwargs: dict[str, object]
-    img_pos_dev: torch.Tensor = field(init=False)
-    audio_pos_dev: torch.Tensor = field(init=False)
-
-
-@dataclass
-class HoistPlan:
-    permutation: torch.Tensor
-    inverse: torch.Tensor
 
 
 def load_module(monkeypatch, name, path):
@@ -293,9 +256,11 @@ def test_all_four_paths_can_hoist_the_same_public_rf_plan(adapter, monkeypatch, 
     )
     plan = torch.tensor([0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 6, 7, 8, 9])
     root = ModuleType("mindiesd")
-    setattr(root, "build_rf_attention_plan", lambda **kwargs: HoistPlan(plan, torch.argsort(plan)))
+    setattr(
+        root, "build_rf_attention_plan", lambda **kwargs: SimpleNamespace(permutation=plan, inverse=torch.argsort(plan))
+    )
     monkeypatch.setitem(sys.modules, "mindiesd", root)
-    branch = HoistBranch(
+    branch = SimpleNamespace(
         seq_len=16,
         used_len=14,
         device=torch.device("cpu"),
@@ -309,7 +274,7 @@ def test_all_four_paths_can_hoist_the_same_public_rf_plan(adapter, monkeypatch, 
             "packed_seq_params": {"vsa_prefix_segments": ()},
         },
     )
-    model = HoistModel([HoistBlock(HoistAttention(adapter.attention))])
+    model = SimpleNamespace(blocks=[SimpleNamespace(attn=SimpleNamespace(attention=adapter.attention))])
     assert helper.maybe_hoist_branch(branch, model)
     layout = branch.static_kwargs["video_token_layout"]
     packed = branch.static_kwargs["packed_seq_params"]

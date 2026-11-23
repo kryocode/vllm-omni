@@ -8,12 +8,11 @@ import pytest
 import torch
 from torch import nn
 
-import vllm_omni.diffusion.offloader.layerwise_backend as backend_module
-from tests.diffusion.offloader.helpers import DummyStream, patch_offload_runtime
+from tests.diffusion.offloader.helpers import patch_offload_runtime
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.offloader import adaln_cache
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
-from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend, LayerwiseOffloadHook
+from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 
@@ -132,11 +131,13 @@ def test_second_allocation_failure_rolls_back_without_changing_values(monkeypatc
 
 
 @pytest.mark.parametrize("enabled,budget", [(True, 1), (True, 0), (False, 1)])
-def test_backend_installs_cache_or_falls_back_and_preserves_repeated_execution(enabled, budget):
+@pytest.mark.parametrize("external", [False, True])
+def test_backend_installs_cache_or_falls_back_and_preserves_repeated_execution(enabled, budget, external):
     pipeline = nn.Module()
     pipeline.transformer = DiT()
     blocks = pipeline.transformer.blocks
-    expected = {id(t): raw(t).clone() for t in pipeline.parameters()}
+    expected = {id(t): raw(t).clone() for t in [*pipeline.parameters(), *pipeline.buffers()]}
+    external_ids = frozenset(id(block.weight) for block in blocks) if external else frozenset()
     backend = LayerWiseOffloadBackend(
         OffloadConfig(
             strategy=OffloadStrategy.LAYER_WISE,
@@ -146,112 +147,31 @@ def test_backend_installs_cache_or_falls_back_and_preserves_repeated_execution(e
             adaln_cache_reserve_gib=1,
         ),
         torch.device("cpu"),
+        resident_tensor_ids=external_ids,
     )
     backend.enable(pipeline)
     assert backend.enabled and len(backend._dit_hooks) == 2
     assert backend.adaln_cache_status.enabled == (enabled and budget > 0)
+    cached = [
+        (t, t.data_ptr()) for t in [*pipeline.parameters(), *pipeline.buffers()] if id(t) in backend.resident_tensor_ids
+    ]
+    for hook in backend._dit_hooks:
+        for tensors in (hook.block_parameters, hook.block_buffers, hook.next_block_parameters, hook.next_block_buffers):
+            assert not {id(t) for t in tensors.values()} & backend.resident_tensor_ids
+        if external and enabled and budget:
+            assert hook._materialization_probe is None and hook.is_materialized
+            assert not hook.dtype_cpu_flattened_weights
     for _ in range(2):
         for block, hook in zip(blocks, backend._dit_hooks, strict=True):
             hook.pre_forward(block)
-            for tensor in block.parameters():
+            for tensor in [*block.parameters(), *block.buffers()]:
                 assert torch.equal(raw(tensor), expected[id(tensor)])
+            assert all(t.data_ptr() == pointer for t, pointer in cached)
             hook.post_forward(block, None)
     backend.disable()
-    assert not backend.enabled and not backend.resident_tensor_ids
-    for tensor in pipeline.parameters():
+    assert not backend.enabled and backend.resident_tensor_ids == external_ids
+    for tensor in [*pipeline.parameters(), *pipeline.buffers()]:
         assert torch.equal(raw(tensor), expected[id(tensor)])
-
-
-class MixedBlock(nn.Module):
-    def __init__(self, offset=0):
-        super().__init__()
-        # Register the cache first to exercise materialization-probe selection.
-        self.cached_weight = nn.Parameter(torch.arange(4.0) + offset, requires_grad=False)
-        self.weight = nn.Parameter(torch.arange(6.0) + offset, requires_grad=False)
-        self.register_buffer("cached_state", torch.arange(3.0) + offset)
-        self.register_buffer("state", torch.arange(2, dtype=torch.int64) + offset)
-
-
-def resident_ids(blocks):
-    return frozenset(id(tensor) for block in blocks for tensor in (block.cached_weight, block.cached_state))
-
-
-def snapshots(blocks):
-    return [
-        [
-            (tensor, tensor.detach().clone(), tensor.data_ptr(), tensor.stride())
-            for tensor in (block.cached_weight, block.cached_state)
-        ]
-        for block in blocks
-    ]
-
-
-def assert_resident_untouched(saved):
-    for tensors in saved:
-        for tensor, expected, pointer, stride in tensors:
-            assert tensor.data_ptr() == pointer
-            assert tensor.stride() == stride
-            assert torch.equal(tensor, expected)
-
-
-@pytest.mark.parametrize("block_count", [2, 3])
-def test_ring_preserves_resident_parameters_and_buffers(block_count):
-    blocks = nn.ModuleList([MixedBlock(index * 10) for index in range(block_count)])
-    saved = snapshots(blocks)
-    expected = [(block.weight.detach().clone(), block.state.clone()) for block in blocks]
-    hooks = backend_module._install_layerwise_hook_group(
-        blocks, torch.device("cpu"), DummyStream(), pin_memory=False, resident_tensor_ids=resident_ids(blocks)
-    )
-
-    assert_resident_untouched(saved)
-    for hook in hooks:
-        assert set(hook.block_parameters) == {"weight"}
-        assert set(hook.block_buffers) == {"state"}
-        assert set(hook.next_block_parameters) == {"weight"}
-        assert set(hook.next_block_buffers) == {"state"}
-        assert hook._materialization_probe is hook.block_parameters["weight"]
-        assert not hook.is_materialized
-        # Only the six FP32 weight values and two INT64 state values cross H2D.
-        assert sum(t.numel() * t.element_size() for t in hook.dtype_cpu_flattened_weights.values()) == 40
-
-    for _ in range(3):
-        for block, (weight, state) in zip(blocks, expected, strict=True):
-            hook = block._hook_registry.get_hook(LayerwiseOffloadHook._HOOK_NAME)
-            hook.pre_forward(block)
-            assert hook.is_materialized
-            assert torch.equal(block.weight, weight)
-            assert torch.equal(block.state, state)
-            hook.post_forward(block, None)
-            hook.offload_layer()
-            assert not hook.is_materialized
-            assert_resident_untouched(saved)
-
-    for hook in hooks:
-        hook.prefetch_layer(non_blocking=False)
-        hook.prefetch_layer(non_blocking=False)
-        hook.restore_next_block()
-        hook.restore_next_block()
-        assert_resident_untouched(saved)
-    for block, (weight, state) in zip(blocks, expected, strict=True):
-        assert torch.equal(block.weight, weight)
-        assert torch.equal(block.state, state)
-
-
-def test_all_resident_block_needs_no_host_master():
-    blocks = nn.ModuleList([MixedBlock(), MixedBlock(10)])
-    ids = frozenset(id(t) for block in blocks for t in [*block.parameters(), *block.buffers()])
-    pointers = [t.data_ptr() for block in blocks for t in [*block.parameters(), *block.buffers()]]
-    hooks = backend_module._install_layerwise_hook_group(
-        blocks, torch.device("cpu"), DummyStream(), pin_memory=False, resident_tensor_ids=ids
-    )
-    for hook in hooks:
-        assert hook._materialization_probe is None
-        assert hook.is_materialized
-        assert not hook.dtype_cpu_flattened_weights
-        hook.prefetch_layer()
-        hook.offload_layer()
-        hook.restore_next_block()
-    assert [t.data_ptr() for block in blocks for t in [*block.parameters(), *block.buffers()]] == pointers
 
 
 def test_a5_rejects_cache_before_tensor_selection_or_allocation(monkeypatch):

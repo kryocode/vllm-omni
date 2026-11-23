@@ -143,6 +143,13 @@ def _worker_threads() -> list[int]:
     return [int(path.name) for path in Path("/proc/self/task").iterdir() if path.name.isdigit()]
 
 
+def _binding_request(od_config: OmniDiffusionConfig) -> bool | None:
+    requested = (getattr(od_config, "additional_config", None) or {}).get("enable_cpu_binding")
+    if requested is not None and not isinstance(requested, bool):
+        raise ValueError("additional_config.enable_cpu_binding must be a boolean")
+    return requested
+
+
 @contextmanager
 def npu_worker_start_affinity(od_config: OmniDiffusionConfig, device_index: int, *, is_npu: bool) -> Iterator[None]:
     """Let a fresh worker inherit local CPUs before Python imports Torch.
@@ -153,10 +160,7 @@ def npu_worker_start_affinity(od_config: OmniDiffusionConfig, device_index: int,
     if not is_npu:
         yield
         return
-    options = getattr(od_config, "additional_config", None) or {}
-    requested = options.get("enable_cpu_binding")
-    if requested is not None and not isinstance(requested, bool):
-        raise ValueError("additional_config.enable_cpu_binding must be a boolean")
+    requested = _binding_request(od_config)
     if requested is False or (requested is None and not _sd16_cache_path(od_config)):
         yield
         return
@@ -194,13 +198,8 @@ def maybe_bind_npu_offload_cpu(od_config: OmniDiffusionConfig, device: torch.dev
     """
     if device is None or getattr(device, "type", None) != "npu":
         return False
-    options = getattr(od_config, "additional_config", None) or {}
-    requested = options.get("enable_cpu_binding")
-    if requested is not None and not isinstance(requested, bool):
-        raise ValueError("additional_config.enable_cpu_binding must be a boolean")
-    if requested is False:
-        return False
-    if requested is None and not _sd16_cache_path(od_config):
+    requested = _binding_request(od_config)
+    if requested is False or (requested is None and not _sd16_cache_path(od_config)):
         return False
     changed: dict[int, set[int]] = {}
     try:
