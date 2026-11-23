@@ -2459,9 +2459,10 @@ class MindIEParallelConfig:
     overlap_comm: bool = True
     reorder_hoist: bool = True
     optimize_attention_pipeline: bool = True
+    quantized_comm: bool = False
 
     def __post_init__(self) -> None:
-        for name in ("overlap_comm", "reorder_hoist", "optimize_attention_pipeline"):
+        for name in ("overlap_comm", "reorder_hoist", "optimize_attention_pipeline", "quantized_comm"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"MindIE parallel {name} must be a boolean and agree across ranks")
 

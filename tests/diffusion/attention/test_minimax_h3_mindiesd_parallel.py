@@ -51,8 +51,8 @@ def adapter(monkeypatch):
     monkeypatch.setattr(platforms, "current_omni_platform", platform)
     monkeypatch.setattr(forward_context, "get_ulysses_mode", lambda **_: "strict")
     stub = ModuleType("mindiesd.parallel")
-    stub.ParallelState = new_state
-    stub.distributed_sparse_attention = distributed_attention
+    setattr(stub, "ParallelState", new_state)
+    setattr(stub, "distributed_sparse_attention", distributed_attention)
     monkeypatch.setitem(sys.modules, stub.__name__, stub)
     module = load_module(monkeypatch, HELPER_NAME, MODEL_DIR / "attention/mindiesd_parallel.py")
     monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
@@ -120,7 +120,7 @@ def run(adapter, *, query=None):
 @pytest.mark.parametrize("enabled", [False, True])
 def test_pipeline_call_is_explicit_and_state_is_reused(adapter, enabled):
     adapter.impl.rainfusion.parallel = adapter.module.MindIEParallelConfig(
-        overlap_comm=enabled, reorder_hoist=enabled, optimize_attention_pipeline=enabled
+        overlap_comm=enabled, reorder_hoist=enabled, optimize_attention_pipeline=enabled, quantized_comm=not enabled
     )
     assert torch.equal(run(adapter), adapter.query + 1)
     run(adapter)
@@ -132,6 +132,7 @@ def test_pipeline_call_is_explicit_and_state_is_reused(adapter, enabled):
     assert not {"group", "cp_group"}.intersection(vars(resource))
     state = adapter.states[0]
     assert state.group is adapter.group
+    assert state.quantized_comm is (not enabled)
     assert state.overlap_comm is enabled
     assert state.optimize_attention_pipeline is enabled
     assert state.bsa_backend == "eagle"

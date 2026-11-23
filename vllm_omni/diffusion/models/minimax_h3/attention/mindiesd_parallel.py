@@ -60,6 +60,7 @@ class MindIEParallelResource:
             overlap_comm=config.overlap_comm,
             optimize_attention_pipeline=config.optimize_attention_pipeline,
             bsa_backend=self.bsa_backend,
+            quantized_comm=config.quantized_comm,
         )
         self.failed = False
         self.active = False

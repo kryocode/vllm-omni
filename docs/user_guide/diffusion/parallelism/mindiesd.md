@@ -16,8 +16,8 @@ native plugin/OPP. The distributed executor supports exactly these paths:
 | --- | --- | --- | --- | --- | --- |
 | RainFusionAttention | `rf_v2` | `bf16` / `fp16` | `cann` | BF16 / FP16 Q/K/V | A2 / A3 |
 | Eagle BSA | `rf_v3` | `bf16` / `fp16` | `eagle` | BF16 / FP16 Q/K/V | A2 / A3 |
-| Eagle QBSA | `rf_v3` | `mix` | `eagle` | INT8 Q/K, FP8 V | A5 |
-| Native MXFP8 BSA | `rf_v3` | `mxfp8` | `cann` | MXFP8 Q/K/V and E8M0 scales | A5 |
+| Eagle QBSA | `rf_v3` | `mix` | `eagle` | BF16; optionally INT8 Q/K, FP8 V | A5 |
+| Native MXFP8 BSA | `rf_v3` | `mxfp8` | `cann` | BF16; optionally MXFP8 Q/K/V and E8M0 scales | A5 |
 
 Omitting `bsa_backend` resolves the provider shown above. A conflicting explicit
 provider or another algorithm/precision tuple raises at configuration time.
@@ -62,6 +62,8 @@ the ready chunks. `optimize_attention_pipeline` enables SDK preparation/buffer
 reuse and can be disabled explicitly. `reorder_hoist` builds the RF plan once
 before RoPE, relabels text/image/audio/output positions and lets SD skip per-layer
 row permutation while preserving RF order. Sparse step/layer gates still apply.
+
+For mix and native MXFP8, `block_sparse.parallel.quantized_comm` defaults to `false`: Q/K/V communicate in BF16 and are quantized after communication for the selected BSA consumer. Set it to `true` to retain quantized communication (INT8 Q/K and FP8 V for mix; MXFP8 payloads and E8M0 scales for MXFP8). This flag is independent of `precision`, overlap and the B optimizations and must agree across workers.
 
 To select the AICPU communication mode, set
 `VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE=2` before startup. It selects the HCCL
