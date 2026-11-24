@@ -337,7 +337,7 @@ class RainFusionAttentionImpl(AttentionImpl):
                     # lengths. Add dummy reference queries only after Ulysses;
                     # their outputs are discarded, so no reference projection
                     # or sequence-parallel exchange is reintroduced.
-                    logger.info_once(
+                    logger.debug_once(
                         "RAINFUSION_ATTN reference-KV reuse active: reference_rows=%d, "
                         "target_q_rows=%d, mode=padded_query; dummy reference outputs discarded.",
                         reference_rows,
@@ -411,7 +411,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             )
             return self.dense_fallback.forward_npu(q, k, v, dense_metadata)
 
-        logger.info_once(
+        logger.debug_once(
             "RAINFUSION_ATTN hybrid active: dense_q_rows=%d, sparse_q_rows=%d, kv_rows=%d, kernel=%s, dtype=%s; "
             "dense guards use Flash, geometry indices cached across layers.",
             plan.dense_query_rows,
@@ -421,7 +421,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             "fp16",
         )
         if reference_rows:
-            logger.info_once(
+            logger.debug_once(
                 "RAINFUSION_ATTN reference-KV reuse active: reference_rows=%d, target_q_rows=%d, "
                 "mode=rectangular_hybrid, dummy_reference_q_rows=0.",
                 reference_rows,
@@ -483,7 +483,7 @@ class RainFusionAttentionImpl(AttentionImpl):
 
         layout = attn_metadata.video_layout
         if layout is None:
-            logger.warning_once(
+            logger.debug_once(
                 "RAINFUSION_ATTN staying dense: this attention role carries no video segment. The "
                 "model must publish AttentionMetadata.video_layout for the sequence to be sparsified."
             )
@@ -531,7 +531,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             )
             return None
         if video_len < _MIN_VIDEO_BLOCKS * _BLOCK_SIZE:
-            logger.warning_once(
+            logger.debug_once(
                 "RAINFUSION_ATTN staying dense: %d video rows is under the %d-row "
                 "(%d block) threshold where sparse selection pays off.",
                 video_len,
@@ -539,7 +539,7 @@ class RainFusionAttentionImpl(AttentionImpl):
                 _MIN_VIDEO_BLOCKS,
             )
             return None
-        logger.info_once(
+        logger.debug_once(
             "RAINFUSION_ATTN active: sparsity=%.2f, start_step=%d, exempt_layers=%d, "
             "latent_grid=%s, prefix_rows=%d, video_rows=%d. Realized sparsity is lower than nominal "
             "because prefix and first-frame blocks are always kept.",
@@ -568,7 +568,6 @@ class RainFusionAttentionImpl(AttentionImpl):
             return None
 
         spans: list[dict[str, object]] = []
-        span_summaries: list[str] = []
         previous_end = 0
         target_count = 0
         video_seqlen = 0
@@ -593,7 +592,7 @@ class RainFusionAttentionImpl(AttentionImpl):
                 return None
             role = span.role
             if role not in ("reference", "target"):
-                logger.warning_once("RAINFUSION_ATTN staying dense: unsupported multi-video span role %r.", role)
+                logger.warning_once("RAINFUSION_ATTN staying dense: multi-video span role must be reference or target.")
                 return None
             if role == "target":
                 target_count += 1
@@ -604,7 +603,6 @@ class RainFusionAttentionImpl(AttentionImpl):
                 # clip boundary.
                 boundary_dense_seqlen += (-previous_video_length) % _BLOCK_SIZE
             spans.append({"start": start, "latent_shape": list(grid)})
-            span_summaries.append(f"role={role}, start={start}, seqlen={length}, latent_shape={grid}")
             previous_end = start + length
             video_seqlen += length
             previous_video_length = length
@@ -616,7 +614,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             )
             return None
         if video_seqlen < _MIN_VIDEO_BLOCKS * _BLOCK_SIZE:
-            logger.warning_once(
+            logger.debug_once(
                 "RAINFUSION_ATTN staying dense: multi-video seqlen=%d is under the sparse threshold seqlen=%d.",
                 video_seqlen,
                 _MIN_VIDEO_BLOCKS * _BLOCK_SIZE,
@@ -631,11 +629,11 @@ class RainFusionAttentionImpl(AttentionImpl):
                 dense_context_seqlen,
             )
             return None
-        logger.info_once(
-            "RAINFUSION_ATTN multi-video active: sparsity=%.2f, spans=[%s], "
+        logger.debug_once(
+            "RAINFUSION_ATTN multi-video active: sparsity=%.2f, spans=%s, "
             "video_seqlen=%d, dense_context_seqlen=%d, valid_packed_seqlen=%d.",
             self.rainfusion.sparsity,
-            "; ".join(span_summaries),
+            layout.video_spans,
             video_seqlen,
             dense_context_seqlen,
             int(used_len),
